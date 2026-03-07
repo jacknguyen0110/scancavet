@@ -16,7 +16,6 @@ APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
 TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
 REQUEST_TIMEOUT = 120
 
-# chống xử lý lặp
 processed_update_ids = []
 processed_file_ids = []
 MAX_UPDATE_IDS = 5000
@@ -132,12 +131,12 @@ def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
 
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # top-left
-    rect[2] = pts[np.argmax(s)]   # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
 
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
 
     return rect
 
@@ -170,10 +169,6 @@ def four_point_transform(image, pts):
 
 
 def detect_rect_cards(img: np.ndarray):
-    """
-    Dò từng cà vẹt riêng lẻ bằng contour/rectangle.
-    Hợp cho ảnh 2-6 thẻ rời nhau.
-    """
     original = img.copy()
     h0, w0 = original.shape[:2]
 
@@ -188,7 +183,7 @@ def detect_rect_cards(img: np.ndarray):
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_area = (work.shape[0] * work.shape[1]) * 0.03
+    min_area = (work.shape[0] * work.shape[1]) * 0.02
     candidates = []
 
     for cnt in contours:
@@ -211,14 +206,14 @@ def detect_rect_cards(img: np.ndarray):
             h, w = warped.shape[:2]
             ratio = w / float(h) if h else 0
 
-            if 1.15 <= ratio <= 2.4 and w >= 250 and h >= 140:
-                x, y, bw, bh = cv2.boundingRect(approx)
+            if 1.10 <= ratio <= 2.6 and w >= 220 and h >= 120:
+                x, y, _, _ = cv2.boundingRect(approx)
                 candidates.append((x, y, warped))
         else:
             x, y, w, h = cv2.boundingRect(cnt)
             ratio = w / float(h) if h else 0
 
-            if 1.15 <= ratio <= 2.4 and w >= 220 and h >= 140:
+            if 1.10 <= ratio <= 2.6 and w >= 200 and h >= 120:
                 ox = int(x / scale)
                 oy = int(y / scale)
                 ow = int(w / scale)
@@ -243,7 +238,7 @@ def detect_rect_cards(img: np.ndarray):
 
     for _, _, crop in candidates:
         h, w = crop.shape[:2]
-        key = (round(w / 40), round(h / 40))
+        key = (round(w / 35), round(h / 35))
         if key in seen:
             continue
         seen.add(key)
@@ -255,18 +250,10 @@ def detect_rect_cards(img: np.ndarray):
 def looks_like_collage(img: np.ndarray) -> bool:
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
-
-    return (
-        w >= 700 and
-        h >= 900 and
-        0.65 <= ratio <= 1.05
-    )
+    return w >= 700 and h >= 900 and 0.65 <= ratio <= 1.05
 
 
 def split_cards_grid_5x4(img: np.ndarray):
-    """
-    Chia cố định ảnh collage thành 20 ô.
-    """
     h, w = img.shape[:2]
     rows, cols = 5, 4
 
@@ -296,13 +283,84 @@ def split_cards_grid_5x4(img: np.ndarray):
     return crops
 
 
+def looks_like_vertical_stack(img: np.ndarray) -> bool:
+    h, w = img.shape[:2]
+    ratio = h / float(w) if w else 0
+    return h >= 1000 and w >= 500 and ratio >= 1.5
+
+
+def split_vertical_stack(img: np.ndarray):
+    """
+    Chia ảnh xếp dọc 3-6 cà vẹt.
+    Dùng projection theo trục Y để tìm khoảng trắng giữa các thẻ.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # thẻ sáng, nền bàn gỗ trung bình -> threshold để lấy vùng thẻ
+    _, th = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY)
+
+    # tính số pixel trắng theo từng dòng
+    proj = np.sum(th == 255, axis=1)
+
+    # dòng thuộc vùng thẻ nếu đủ trắng
+    white_threshold = int(w * 0.35)
+    mask = proj > white_threshold
+
+    bands = []
+    in_band = False
+    start = 0
+
+    for i, val in enumerate(mask):
+        if val and not in_band:
+            start = i
+            in_band = True
+        elif not val and in_band:
+            end = i
+            if end - start > 120:
+                bands.append((start, end))
+            in_band = False
+
+    if in_band:
+        end = h
+        if end - start > 120:
+            bands.append((start, end))
+
+    crops = []
+    for y1, y2 in bands:
+        pad_y = int((y2 - y1) * 0.03)
+        yy1 = max(0, y1 - pad_y)
+        yy2 = min(h, y2 + pad_y)
+
+        # tìm biên ngang hữu ích
+        band = img[yy1:yy2, :]
+        gray_band = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        _, th_band = cv2.threshold(gray_band, 180, 255, cv2.THRESH_BINARY)
+
+        proj_x = np.sum(th_band == 255, axis=0)
+        xmask = proj_x > int((yy2 - yy1) * 0.20)
+
+        xs = np.where(xmask)[0]
+        if len(xs) == 0:
+            continue
+
+        x1 = max(0, int(xs.min()) - 10)
+        x2 = min(w, int(xs.max()) + 10)
+
+        crop = img[yy1:yy2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        ch, cw = crop.shape[:2]
+        ratio = cw / float(ch) if ch else 0
+        if 1.10 <= ratio <= 2.6:
+            crops.append(crop)
+
+    return crops
+
+
 def detect_cards(img: np.ndarray):
-    """
-    Ưu tiên:
-    1) detect từng thẻ riêng
-    2) nếu là ảnh collage thì chia 5x4
-    3) fallback 1 thẻ
-    """
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
     logger.info("Image size: w=%s h=%s ratio=%.3f", w, h, ratio)
@@ -311,6 +369,12 @@ def detect_cards(img: np.ndarray):
     if len(rect_cards) >= 2:
         logger.info("Rect-card detect -> %s crops", len(rect_cards))
         return rect_cards
+
+    if looks_like_vertical_stack(img):
+        vertical_cards = split_vertical_stack(img)
+        if len(vertical_cards) >= 2:
+            logger.info("Vertical-stack detect -> %s crops", len(vertical_cards))
+            return vertical_cards
 
     if looks_like_collage(img):
         crops = split_cards_grid_5x4(img)
@@ -348,9 +412,6 @@ def clean_text(text: str) -> str:
 
 
 def normalize_plate_to_compact(text: str) -> str:
-    """
-    50G-018.74 -> 50G01874
-    """
     x = text.upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
@@ -401,9 +462,6 @@ def extract_any_plate(text: str):
 
 
 def extract_plate_from_crop(card_img: np.ndarray):
-    """
-    Chỉ trả về 1 biển số tốt nhất cho mỗi thẻ.
-    """
     h, w = card_img.shape[:2]
     rois = []
 
@@ -450,13 +508,7 @@ def extract_plate_from_crop(card_img: np.ndarray):
 # =========================
 # APPS SCRIPT
 # =========================
-def send_to_apps_script(
-    img_bytes: bytes,
-    plate: str,
-    caption: str,
-    chat_id: int,
-    name: str
-):
+def send_to_apps_script(img_bytes: bytes, plate: str, caption: str, chat_id: int, name: str):
     if not APPS_SCRIPT_URL:
         raise Exception("Thiếu APPS_SCRIPT_URL")
 
