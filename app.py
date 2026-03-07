@@ -1,138 +1,224 @@
 import os
-import cv2
-import json
-import numpy as np
-import requests
-import pytesseract
 import re
+import cv2
 import base64
+import logging
+import requests
+import numpy as np
+import pytesseract
 from flask import Flask, request, jsonify
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
-TESS_LANG = os.getenv("TESS_LANG", "vie+eng")
+# =========================
+# CONFIG
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
+TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
+
+REQUEST_TIMEOUT = 120
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def tg(method):
+# =========================
+# TELEGRAM
+# =========================
+def tg_url(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
 
-def send(chat_id, text):
-    requests.post(
-        tg("sendMessage"),
-        json={"chat_id": chat_id, "text": text},
-        timeout=60
-    )
+def send_message(chat_id: int, text: str) -> None:
+    try:
+        requests.post(
+            tg_url("sendMessage"),
+            json={"chat_id": chat_id, "text": text},
+            timeout=REQUEST_TIMEOUT
+        )
+    except Exception as e:
+        logger.exception("send_message error: %s", e)
 
 
-def get_file(file_id):
+def get_telegram_file_url(file_id: str) -> str:
     r = requests.get(
-        tg("getFile"),
+        tg_url("getFile"),
         params={"file_id": file_id},
-        timeout=60
+        timeout=REQUEST_TIMEOUT
     )
     r.raise_for_status()
     data = r.json()
+
     if not data.get("ok"):
         raise Exception(f"Telegram getFile lỗi: {data}")
-    path = data["result"]["file_path"]
-    return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}"
+
+    file_path = data["result"]["file_path"]
+    return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
 
-def bytes_to_img(b):
-    arr = np.frombuffer(b, np.uint8)
+def download_telegram_file(file_id: str) -> bytes:
+    file_url = get_telegram_file_url(file_id)
+    r = requests.get(file_url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+
+# =========================
+# IMAGE UTIL
+# =========================
+def bytes_to_img(image_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise Exception("Không decode được ảnh")
+        raise Exception("Không decode được ảnh đầu vào")
     return img
 
 
-def img_to_bytes(img):
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+def img_to_jpg_bytes(img: np.ndarray, quality: int = 95) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         raise Exception("Không encode được ảnh JPG")
     return buf.tobytes()
 
 
-def detect_cards(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
+def resize_for_processing(img: np.ndarray, max_side: int = 1800):
+    h, w = img.shape[:2]
+    side = max(h, w)
+    if side <= max_side:
+        return img.copy(), 1.0
 
+    scale = max_side / float(side)
+    nw = int(w * scale)
+    nh = int(h * scale)
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+# =========================
+# DETECT CÀ VẸT
+# =========================
+def detect_cards(img: np.ndarray):
+    """
+    Tìm các vùng giống cà vẹt trong ảnh.
+    Nếu không tìm được thì fallback trả về toàn ảnh.
+    """
+    original = img.copy()
+    work, scale = resize_for_processing(img, max_side=1800)
+
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 50, 150)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     edges = cv2.dilate(edges, kernel, iterations=2)
     edges = cv2.erode(edges, kernel, iterations=1)
 
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    res = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 50000:
+    h_img, w_img = work.shape[:2]
+    min_area = (h_img * w_img) * 0.02
+
+    candidates = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
             continue
 
-        x, y, w, h = cv2.boundingRect(c)
-        ratio = w / float(h)
+        x, y, w, h = cv2.boundingRect(cnt)
+        ratio = w / float(h) if h else 0
 
-        # cà vẹt ngang
-        if 1.2 < ratio < 2.5 and w > 300 and h > 150:
-            res.append((x, y, img[y:y+h, x:x+w]))
+        if 1.2 <= ratio <= 2.5 and w > 250 and h > 120:
+            ox = int(x / scale)
+            oy = int(y / scale)
+            ow = int(w / scale)
+            oh = int(h / scale)
 
-    if not res:
-        return [img]
+            ox = max(0, ox)
+            oy = max(0, oy)
+            ow = min(original.shape[1] - ox, ow)
+            oh = min(original.shape[0] - oy, oh)
 
-    # sort trái -> phải, trên -> dưới để ổn định
-    res.sort(key=lambda t: (t[1], t[0]))
-    return [x[2] for x in res[:20]]
+            crop = original[oy:oy + oh, ox:ox + ow]
+            if crop.size > 0:
+                candidates.append((ox, oy, crop))
+
+    if not candidates:
+        return [original]
+
+    # sort trên -> dưới, trái -> phải
+    candidates.sort(key=lambda x: (x[1], x[0]))
+
+    # bỏ duplicate gần giống nhau theo kích thước
+    results = []
+    seen = set()
+    for _, _, crop in candidates:
+        h, w = crop.shape[:2]
+        key = (round(w / 50), round(h / 50))
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(crop)
+
+    return results[:20]
 
 
-def preprocess(img):
+# =========================
+# OCR
+# =========================
+def preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
     th = cv2.adaptiveThreshold(
-        gray, 255,
+        gray,
+        255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        31, 15
+        31,
+        15
     )
     return th
 
 
-def normalize_plate_digits(plate_raw):
-    """
-    Chuyển:
-    50F-054.23
-    50F054.23
-    50F 054 23
-    -> 50F05423
-    """
-    p = plate_raw.upper()
-    p = p.replace("O", "0")
-    p = re.sub(r"[^0-9A-Z]", "", p)
-    return p
+def normalize_plate_raw(text: str) -> str:
+    x = text.upper()
+    x = x.replace("O", "0")
+    x = x.replace("I", "1")
+    x = x.replace("L", "1")
+    x = x.replace(",", ".")
+    x = x.replace("–", "-").replace("—", "-")
+    x = re.sub(r"\s+", "", x)
+    x = re.sub(r"[^0-9A-Z\.-]", "", x)
+    return x
 
 
-def find_best_plate(text):
+def normalize_plate_digits(candidate: str) -> str:
     """
-    Chỉ nhận đúng format 2 số + 1 chữ + 5 số
-    Ví dụ: 50F05423
+    50F-054.23 -> 50F05423
+    50F054.23 -> 50F05423
+    50F 054 23 -> 50F05423
+    """
+    x = candidate.upper()
+    x = x.replace("O", "0")
+    x = re.sub(r"[^0-9A-Z]", "", x)
+    return x
+
+
+def find_best_plate(text: str):
+    """
+    Chỉ nhận đúng dạng:
+    2 số + 1 chữ + 5 số
+    ví dụ 50F05423
     """
     if not text:
         return None
 
-    raw = text.upper()
-    raw = raw.replace("O", "0")
-    raw = raw.replace("I", "1")
-    raw = raw.replace("L", "1")
-    raw = raw.replace(",", ".")
-    raw = raw.replace("–", "-").replace("—", "-")
+    raw = normalize_plate_raw(text)
 
-    # Tìm các dạng phổ biến
     patterns = [
-        r"\b\d{2}[A-Z]\s?-?\s?\d{3}[.\s]?\d{2}\b",
-        r"\b\d{2}[A-Z]\d{5}\b"
+        r"\b\d{2}[A-Z]-?\d{3}\.?\d{2}\b",
+        r"\b\d{2}[A-Z]\d{5}\b",
+        r"\b\d{2}[A-Z]\s?\d{3}\s?\d{2}\b",
     ]
 
     candidates = []
@@ -142,69 +228,80 @@ def find_best_plate(text):
     normalized = []
     for c in candidates:
         n = normalize_plate_digits(c)
-        # chỉ lấy đúng 8 ký tự: 2 số + 1 chữ + 5 số
         if re.fullmatch(r"\d{2}[A-Z]\d{5}", n):
             normalized.append(n)
 
     if not normalized:
         return None
 
-    # ưu tiên biển số bắt đầu bằng 2 số tỉnh/thành
-    # lấy candidate đầu tiên
     return normalized[0]
 
 
-def extract_plate_from_crop(card_img):
+def extract_plate_from_crop(card_img: np.ndarray):
     """
-    Chỉ OCR vùng ưu tiên là phần dưới bên trái của cà vẹt,
-    để tránh đọc nhầm số khác như 22A22084.
+    Ưu tiên OCR vùng dưới bên trái để tránh đọc nhầm số khác.
     """
     h, w = card_img.shape[:2]
-
     rois = []
 
-    # ROI 1: nửa dưới bên trái
+    # vùng biển số thường ở nửa dưới bên trái
     roi1 = card_img[int(h * 0.45):int(h * 0.92), 0:int(w * 0.62)]
     if roi1.size > 0:
         rois.append(roi1)
 
-    # ROI 2: gần giữa dưới
-    roi2 = card_img[int(h * 0.40):int(h * 0.88), int(w * 0.05):int(w * 0.75)]
+    # mở rộng thêm một chút
+    roi2 = card_img[int(h * 0.40):int(h * 0.90), int(w * 0.03):int(w * 0.75)]
     if roi2.size > 0:
         rois.append(roi2)
 
-    # ROI 3: toàn card fallback
+    # fallback toàn card
     rois.append(card_img)
 
-    all_text = []
+    collected_texts = []
 
     for roi in rois:
-        txt1 = pytesseract.image_to_string(roi, lang=TESS_LANG, config="--psm 6")
-        all_text.append(txt1)
+        txt1 = pytesseract.image_to_string(
+            roi,
+            lang=TESS_LANG,
+            config="--oem 3 --psm 6"
+        )
+        collected_texts.append(txt1)
 
-        pre = preprocess(roi)
-        txt2 = pytesseract.image_to_string(pre, lang=TESS_LANG, config="--psm 6")
-        all_text.append(txt2)
+        pre = preprocess_for_ocr(roi)
+        txt2 = pytesseract.image_to_string(
+            pre,
+            lang=TESS_LANG,
+            config="--oem 3 --psm 6"
+        )
+        collected_texts.append(txt2)
 
-        combined = "\n".join(all_text)
+        combined = "\n".join(collected_texts)
         plate = find_best_plate(combined)
         if plate:
             return plate, combined
 
-    return None, "\n".join(all_text)
+    return None, "\n".join(collected_texts)
 
 
-def send_to_apps_script(img_bytes, plate, caption, chat, name, ocr_text):
+# =========================
+# APPS SCRIPT
+# =========================
+def send_to_apps_script(
+    img_bytes: bytes,
+    plate: str,
+    caption: str,
+    chat_id: int,
+    name: str,
+    ocr_text: str
+):
     if not APPS_SCRIPT_URL:
         raise Exception("Thiếu APPS_SCRIPT_URL")
 
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
-
     payload = {
-        "image": b64,
+        "image": base64.b64encode(img_bytes).decode("utf-8"),
         "plate": plate or "",
         "caption": caption or "",
-        "chatId": str(chat),
+        "chatId": str(chat_id),
         "name": name or "",
         "ocrText": ocr_text or ""
     }
@@ -212,16 +309,30 @@ def send_to_apps_script(img_bytes, plate, caption, chat, name, ocr_text):
     r = requests.post(
         APPS_SCRIPT_URL,
         json=payload,
-        timeout=120
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True
     )
 
-    # Bắt lỗi rõ
-    r.raise_for_status()
+    content_type = r.headers.get("Content-Type", "")
+    body_preview = r.text[:1000]
+
+    if r.status_code != 200:
+        raise Exception(f"Apps Script HTTP {r.status_code}: {body_preview}")
+
+    is_probably_json = (
+        "application/json" in content_type.lower()
+        or body_preview.strip().startswith("{")
+    )
+
+    if not is_probably_json:
+        raise Exception(
+            f"Apps Script không trả JSON. Content-Type={content_type}. Body={body_preview}"
+        )
 
     try:
         data = r.json()
     except Exception:
-        raise Exception(f"Apps Script không trả JSON hợp lệ: {r.text[:500]}")
+        raise Exception(f"Apps Script không trả JSON hợp lệ: {body_preview}")
 
     if data.get("status") != "ok":
         raise Exception(f"Apps Script lỗi: {data}")
@@ -229,90 +340,121 @@ def send_to_apps_script(img_bytes, plate, caption, chat, name, ocr_text):
     return data
 
 
-def process(file_id, chat, name, caption):
-    url = get_file(file_id)
-
-    img_bytes = requests.get(url, timeout=120).content
-    img = bytes_to_img(img_bytes)
-
+# =========================
+# MAIN PROCESS
+# =========================
+def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
+    raw_bytes = download_telegram_file(file_id)
+    img = bytes_to_img(raw_bytes)
     crops = detect_cards(img)
 
-    found = []
+    found_plates = []
     saved_count = 0
 
-    for c in crops:
-        plate, ocr_text = extract_plate_from_crop(c)
-        crop_bytes = img_to_bytes(c)
+    for crop in crops:
+        plate, ocr_text = extract_plate_from_crop(crop)
+        crop_bytes = img_to_jpg_bytes(crop)
 
-        result = send_to_apps_script(
-            crop_bytes,
-            plate,
-            caption,
-            chat,
-            name,
-            ocr_text
+        send_to_apps_script(
+            img_bytes=crop_bytes,
+            plate=plate,
+            caption=caption,
+            chat_id=chat_id,
+            name=full_name,
+            ocr_text=ocr_text
         )
 
         saved_count += 1
-
         if plate:
-            found.append(plate)
+            found_plates.append(plate)
 
-    return found, saved_count
-
-
-@app.route("/telegram/webhook", methods=["POST"])
-def webhook():
-    data = request.json or {}
-    msg = data.get("message")
-
-    if not msg:
-        return "ok"
-
-    chat = msg["chat"]["id"]
-    user = msg.get("from", {})
-    name = f'{user.get("first_name","")} {user.get("last_name","")}'.strip()
-    caption = msg.get("caption", "")
-
-    try:
-        if "photo" in msg:
-            file_id = msg["photo"][-1]["file_id"]
-            plates, saved_count = process(file_id, chat, name, caption)
-
-        elif "document" in msg:
-            file_id = msg["document"]["file_id"]
-            plates, saved_count = process(file_id, chat, name, caption)
-
-        else:
-            send(chat, "📸 Gửi ảnh cà vẹt để quét")
-            return "ok"
-
-        if plates:
-            unique_plates = list(dict.fromkeys(plates))
-            send(
-                chat,
-                "✅ Đã quét và lưu thành công.\n"
-                f"Số ảnh crop đã lưu: {saved_count}\n"
-                "Biển số:\n" + "\n".join(unique_plates)
-            )
-        else:
-            send(
-                chat,
-                "⚠️ Đã lưu ảnh crop nhưng chưa đọc chắc chắn ra biển số."
-                f"\nSố ảnh crop đã lưu: {saved_count}"
-            )
-
-    except Exception as e:
-        send(chat, f"❌ Lỗi xử lý: {str(e)}")
-
-    return "ok"
+    # unique nhưng giữ thứ tự
+    found_plates = list(dict.fromkeys(found_plates))
+    return found_plates, saved_count
 
 
-@app.route("/")
+# =========================
+# FLASK ROUTES
+# =========================
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({"status": "running"})
 
 
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    try:
+        data = request.get_json(silent=True) or {}
+        msg = data.get("message") or data.get("edited_message")
+
+        if not msg:
+            return "ok", 200
+
+        chat_id = msg["chat"]["id"]
+        user = msg.get("from", {}) or {}
+        full_name = f'{user.get("first_name", "")} {user.get("last_name", "")}'.strip()
+        caption = msg.get("caption", "") or ""
+
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]
+            plates, saved_count = process_file(file_id, chat_id, full_name, caption)
+
+        elif msg.get("document"):
+            doc = msg["document"]
+            mime = (doc.get("mime_type") or "").lower()
+            fname = (doc.get("file_name") or "").lower()
+            is_image = mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+            if not is_image:
+                send_message(chat_id, "⚠️ File này không phải ảnh. Hãy gửi JPG/PNG/WebP.")
+                return "ok", 200
+
+            file_id = doc["file_id"]
+            plates, saved_count = process_file(file_id, chat_id, full_name, caption)
+
+        else:
+            send_message(chat_id, "📸 Gửi ảnh cà vẹt để quét biển số.")
+            return "ok", 200
+
+        if plates:
+            send_message(
+                chat_id,
+                "✅ Đã quét và lưu thành công.\n"
+                f"Số ảnh crop đã lưu: {saved_count}\n"
+                "Biển số:\n" + "\n".join(plates)
+            )
+        else:
+            send_message(
+                chat_id,
+                "⚠️ Đã lưu ảnh crop nhưng chưa đọc chắc chắn ra biển số.\n"
+                f"Số ảnh crop đã lưu: {saved_count}"
+            )
+
+        return "ok", 200
+
+    except Exception as e:
+        logger.exception("telegram_webhook error: %s", e)
+
+        try:
+            data = request.get_json(silent=True) or {}
+            msg = data.get("message") or {}
+            chat_id = msg.get("chat", {}).get("id")
+            if chat_id:
+                send_message(chat_id, f"❌ Lỗi xử lý: {str(e)}")
+        except Exception:
+            pass
+
+        return "ok", 200
+
+
+# =========================
+# START
+# =========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN")
+    if not APPS_SCRIPT_URL:
+        logger.warning("Thiếu APPS_SCRIPT_URL")
+
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
