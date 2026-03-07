@@ -14,12 +14,42 @@ from flask import Flask, request, jsonify
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
 TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
-
 REQUEST_TIMEOUT = 120
+
+# cache chống xử lý lặp
+processed_update_ids = []
+processed_file_ids = []
+MAX_UPDATE_IDS = 5000
+MAX_FILE_IDS = 3000
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# =========================
+# DEDUPE
+# =========================
+def remember_update_id(update_id):
+    global processed_update_ids
+    processed_update_ids.append(update_id)
+    if len(processed_update_ids) > MAX_UPDATE_IDS:
+        processed_update_ids = processed_update_ids[-2000:]
+
+
+def remember_file_id(file_id):
+    global processed_file_ids
+    processed_file_ids.append(file_id)
+    if len(processed_file_ids) > MAX_FILE_IDS:
+        processed_file_ids = processed_file_ids[-1000:]
+
+
+def is_duplicate_update(update_id):
+    return update_id in processed_update_ids
+
+
+def is_duplicate_file(file_id):
+    return file_id in processed_file_ids
 
 
 # =========================
@@ -101,7 +131,6 @@ def looks_like_collage(img: np.ndarray) -> bool:
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
 
-    # Nới điều kiện để bắt đúng ảnh ghép Telegram preview / document
     return (
         w >= 700 and
         h >= 900 and
@@ -110,9 +139,6 @@ def looks_like_collage(img: np.ndarray) -> bool:
 
 
 def split_cards_grid_5x4(img: np.ndarray):
-    """
-    Cắt cố định 5 hàng x 4 cột cho ảnh ghép 20 thẻ.
-    """
     h, w = img.shape[:2]
     rows, cols = 5, 4
 
@@ -127,7 +153,6 @@ def split_cards_grid_5x4(img: np.ndarray):
             x2 = int((c + 1) * cell_w)
             y2 = int((r + 1) * cell_h)
 
-            # cắt nhẹ mép ngoài
             pad_x = int((x2 - x1) * 0.02)
             pad_y = int((y2 - y1) * 0.02)
 
@@ -144,10 +169,6 @@ def split_cards_grid_5x4(img: np.ndarray):
 
 
 def detect_cards(img: np.ndarray):
-    """
-    - Ảnh ghép: chia 5x4
-    - Ảnh thường: 1 crop
-    """
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
     logger.info("Image size: w=%s h=%s ratio=%.3f", w, h, ratio)
@@ -188,10 +209,6 @@ def clean_text(text: str) -> str:
 
 
 def normalize_plate_to_compact(text: str) -> str:
-    """
-    29A-111.11 -> 29A11111
-    50F-054.23 -> 50F05423
-    """
     x = text.upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
@@ -242,23 +259,17 @@ def extract_any_plate(text: str):
 
 
 def extract_plate_from_crop(card_img: np.ndarray):
-    """
-    Chỉ trả về 1 biển số tốt nhất cho mỗi crop.
-    """
     h, w = card_img.shape[:2]
     rois = []
 
-    # ROI chính: vùng biển số phía dưới bên trái
     roi1 = card_img[int(h * 0.42):int(h * 0.95), 0:int(w * 0.70)]
     if roi1.size > 0:
         rois.append(roi1)
 
-    # ROI rộng hơn
     roi2 = card_img[int(h * 0.35):int(h * 0.98), 0:int(w * 0.85)]
     if roi2.size > 0:
         rois.append(roi2)
 
-    # fallback: toàn thẻ
     rois.append(card_img)
 
     all_texts = []
@@ -402,8 +413,16 @@ def home():
 def telegram_webhook():
     try:
         data = request.get_json(silent=True) or {}
-        msg = data.get("message") or data.get("edited_message")
 
+        update_id = data.get("update_id")
+        if update_id is not None and is_duplicate_update(update_id):
+            logger.info("Duplicate update skipped: %s", update_id)
+            return "ok", 200
+
+        if update_id is not None:
+            remember_update_id(update_id)
+
+        msg = data.get("message") or data.get("edited_message")
         if not msg:
             return "ok", 200
 
@@ -412,9 +431,10 @@ def telegram_webhook():
         full_name = f'{user.get("first_name", "")} {user.get("last_name", "")}'.strip()
         caption = msg.get("caption", "") or ""
 
+        file_id = None
+
         if msg.get("photo"):
             file_id = msg["photo"][-1]["file_id"]
-            plates, saved_count = process_file(file_id, chat_id, full_name, caption)
 
         elif msg.get("document"):
             doc = msg["document"]
@@ -427,11 +447,19 @@ def telegram_webhook():
                 return "ok", 200
 
             file_id = doc["file_id"]
-            plates, saved_count = process_file(file_id, chat_id, full_name, caption)
 
         else:
             send_message(chat_id, "📸 Gửi ảnh cà vẹt để quét biển số.")
             return "ok", 200
+
+        if file_id and is_duplicate_file(file_id):
+            logger.info("Duplicate file skipped: %s", file_id)
+            return "ok", 200
+
+        if file_id:
+            remember_file_id(file_id)
+
+        plates, saved_count = process_file(file_id, chat_id, full_name, caption)
 
         if plates:
             send_message(
