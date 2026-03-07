@@ -16,6 +16,7 @@ APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
 TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
 REQUEST_TIMEOUT = 120
 
+# chống xử lý lặp
 processed_update_ids = []
 processed_file_ids = []
 MAX_UPDATE_IDS = 5000
@@ -131,12 +132,12 @@ def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
 
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
 
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
 
     return rect
 
@@ -169,6 +170,10 @@ def four_point_transform(image, pts):
 
 
 def detect_rect_cards(img: np.ndarray):
+    """
+    Dò từng cà vẹt rời nhau bằng contour/rectangle.
+    Hợp cho ảnh 2-6 thẻ.
+    """
     original = img.copy()
     h0, w0 = original.shape[:2]
 
@@ -250,10 +255,19 @@ def detect_rect_cards(img: np.ndarray):
 def looks_like_collage(img: np.ndarray) -> bool:
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
-    return w >= 700 and h >= 900 and 0.65 <= ratio <= 1.05
+
+    # chỉ nhận collage khi ảnh đủ lớn và gần đúng kiểu 20 ô
+    return (
+        w >= 850 and
+        h >= 1150 and
+        0.68 <= ratio <= 0.90
+    )
 
 
 def split_cards_grid_5x4(img: np.ndarray):
+    """
+    Chia ảnh collage thành 20 ô.
+    """
     h, w = img.shape[:2]
     rows, cols = 5, 4
 
@@ -286,26 +300,27 @@ def split_cards_grid_5x4(img: np.ndarray):
 def looks_like_vertical_stack(img: np.ndarray) -> bool:
     h, w = img.shape[:2]
     ratio = h / float(w) if w else 0
-    return h >= 1000 and w >= 500 and ratio >= 1.5
+
+    return (
+        h >= 1100 and
+        w >= 700 and
+        ratio >= 1.20
+    )
 
 
 def split_vertical_stack(img: np.ndarray):
     """
     Chia ảnh xếp dọc 3-6 cà vẹt.
-    Dùng projection theo trục Y để tìm khoảng trắng giữa các thẻ.
     """
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # thẻ sáng, nền bàn gỗ trung bình -> threshold để lấy vùng thẻ
-    _, th = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY)
+    _, th = cv2.threshold(blur, 185, 255, cv2.THRESH_BINARY)
 
-    # tính số pixel trắng theo từng dòng
     proj = np.sum(th == 255, axis=1)
 
-    # dòng thuộc vùng thẻ nếu đủ trắng
-    white_threshold = int(w * 0.35)
+    white_threshold = int(w * 0.32)
     mask = proj > white_threshold
 
     bands = []
@@ -329,24 +344,23 @@ def split_vertical_stack(img: np.ndarray):
 
     crops = []
     for y1, y2 in bands:
-        pad_y = int((y2 - y1) * 0.03)
+        pad_y = int((y2 - y1) * 0.08)
         yy1 = max(0, y1 - pad_y)
         yy2 = min(h, y2 + pad_y)
 
-        # tìm biên ngang hữu ích
         band = img[yy1:yy2, :]
         gray_band = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-        _, th_band = cv2.threshold(gray_band, 180, 255, cv2.THRESH_BINARY)
+        _, th_band = cv2.threshold(gray_band, 170, 255, cv2.THRESH_BINARY)
 
         proj_x = np.sum(th_band == 255, axis=0)
-        xmask = proj_x > int((yy2 - yy1) * 0.20)
+        xmask = proj_x > int((yy2 - yy1) * 0.15)
 
         xs = np.where(xmask)[0]
         if len(xs) == 0:
             continue
 
-        x1 = max(0, int(xs.min()) - 10)
-        x2 = min(w, int(xs.max()) + 10)
+        x1 = max(0, int(xs.min()) - 15)
+        x2 = min(w, int(xs.max()) + 15)
 
         crop = img[yy1:yy2, x1:x2]
         if crop.size == 0:
@@ -354,6 +368,7 @@ def split_vertical_stack(img: np.ndarray):
 
         ch, cw = crop.shape[:2]
         ratio = cw / float(ch) if ch else 0
+
         if 1.10 <= ratio <= 2.6:
             crops.append(crop)
 
@@ -361,6 +376,13 @@ def split_vertical_stack(img: np.ndarray):
 
 
 def detect_cards(img: np.ndarray):
+    """
+    Ưu tiên:
+    1) detect thẻ rời
+    2) detect stack dọc
+    3) detect collage 5x4
+    4) fallback 1 thẻ
+    """
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
     logger.info("Image size: w=%s h=%s ratio=%.3f", w, h, ratio)
@@ -412,6 +434,9 @@ def clean_text(text: str) -> str:
 
 
 def normalize_plate_to_compact(text: str) -> str:
+    """
+    50H-318.75 -> 50H31875
+    """
     x = text.upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
