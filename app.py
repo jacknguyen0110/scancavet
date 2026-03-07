@@ -6,178 +6,69 @@ import numpy as np
 import requests
 import pytesseract
 import re
+import base64
+
 from datetime import datetime
 from flask import Flask, request, jsonify
 
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# =========================
-# ENV
-# =========================
+APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_NAME = os.getenv("SHEET_NAME")
-
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-
-TESS_LANG = os.getenv("TESS_LANG", "vie+eng")
-
-OWNER_EMAIL = "jacknguyen0110@gmail.com"
+TESS_LANG = "vie+eng"
 
 app = Flask(__name__)
 
 
-# =========================
-# GOOGLE AUTH
-# =========================
-
-def get_google_credentials():
-
-    info = json.loads(SERVICE_ACCOUNT_JSON)
-
-    scopes = [
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/spreadsheets"
-    ]
-
-    return Credentials.from_service_account_info(info, scopes=scopes)
-
-
-def get_drive():
-
-    creds = get_google_credentials()
-
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-
-def get_sheet():
-
-    gc = gspread.authorize(get_google_credentials())
-
-    sh = gc.open_by_key(SPREADSHEET_ID)
-
-    try:
-
-        ws = sh.worksheet(SHEET_NAME)
-
-    except:
-
-        ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
-
-    return ws
-
-
-# =========================
-# TELEGRAM
-# =========================
-
 def tg(method):
+    return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
-    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
-
-def send(chat_id, text):
-
+def send(chat,text):
     requests.post(
         tg("sendMessage"),
-        json={"chat_id": chat_id, "text": text}
+        json={"chat_id":chat,"text":text}
     )
 
 
 def get_file(file_id):
 
-    r = requests.get(tg("getFile"), params={"file_id": file_id})
+    r = requests.get(
+        tg("getFile"),
+        params={"file_id":file_id}
+    )
 
     path = r.json()["result"]["file_path"]
 
-    return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{path}"
+    return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}"
 
-
-# =========================
-# DRIVE
-# =========================
-
-def upload(img_bytes, filename):
-
-    drive = get_drive()
-
-    media = MediaIoBaseUpload(
-        io.BytesIO(img_bytes),
-        mimetype="image/jpeg"
-    )
-
-    metadata = {
-        "name": filename,
-        "parents": [DRIVE_FOLDER_ID]
-    }
-
-    file = drive.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id,webViewLink"
-    ).execute()
-
-    file_id = file["id"]
-
-    # share to your gmail
-    try:
-
-        drive.permissions().create(
-            fileId=file_id,
-            body={
-                "type": "user",
-                "role": "reader",
-                "emailAddress": OWNER_EMAIL
-            }
-        ).execute()
-
-    except:
-        pass
-
-    return file_id, file["webViewLink"]
-
-
-# =========================
-# IMAGE
-# =========================
 
 def bytes_to_img(b):
 
-    arr = np.frombuffer(b, np.uint8)
+    arr=np.frombuffer(b,np.uint8)
 
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return cv2.imdecode(arr,cv2.IMREAD_COLOR)
 
 
 def img_to_bytes(img):
 
-    _, buf = cv2.imencode(".jpg", img)
+    _,buf=cv2.imencode(".jpg",img)
 
     return buf.tobytes()
 
 
-# =========================
-# DETECT CAVET
-# =========================
-
 def detect(img):
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
 
-    blur = cv2.GaussianBlur(gray, (5,5),0)
+    blur=cv2.GaussianBlur(gray,(5,5),0)
 
-    edges = cv2.Canny(blur,50,150)
+    edges=cv2.Canny(blur,50,150)
 
-    cnts,_ = cv2.findContours(edges,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    cnts,_=cv2.findContours(edges,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
 
-    out=[]
+    res=[]
 
     for c in cnts:
 
@@ -192,17 +83,13 @@ def detect(img):
 
         if 1.2<ratio<2.5:
 
-            out.append(img[y:y+h,x:x+w])
+            res.append(img[y:y+h,x:x+w])
 
-    if not out:
+    if not res:
         return [img]
 
-    return out[:20]
+    return res[:20]
 
-
-# =========================
-# OCR
-# =========================
 
 def preprocess(img):
 
@@ -211,7 +98,9 @@ def preprocess(img):
     return cv2.adaptiveThreshold(
         gray,255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,31,15
+        cv2.THRESH_BINARY,
+        31,
+        15
     )
 
 
@@ -224,17 +113,17 @@ def ocr(img):
     )
 
 
-def plate(text):
+def extract_plate(text):
 
     raw=text.upper()
 
     raw=raw.replace("O","0")
 
-    m=re.findall(r"\d{2}[A-Z]\s?-?\d{3}[.\s]?\d{2}",raw)
+    matches=re.findall(r"\d{2}[A-Z]\s?-?\d{3}[.\s]?\d{2}",raw)
 
-    out=[]
+    plates=[]
 
-    for p in m:
+    for p in matches:
 
         p=re.sub(r"\s","",p)
 
@@ -244,14 +133,26 @@ def plate(text):
 
             p=p[:3]+"-"+p[3:6]+"."+p[6:]
 
-        out.append(p)
+        plates.append(p)
 
-    return list(set(out))
+    return list(set(plates))
 
 
-# =========================
-# PROCESS
-# =========================
+def send_to_apps_script(img_bytes,plate,caption,chat,name):
+
+    b64=base64.b64encode(img_bytes).decode()
+
+    requests.post(
+        APPS_SCRIPT_URL,
+        json={
+            "image":b64,
+            "plate":plate,
+            "caption":caption,
+            "chatId":chat,
+            "name":name
+        }
+    )
+
 
 def process(file_id,chat,name,caption):
 
@@ -263,39 +164,27 @@ def process(file_id,chat,name,caption):
 
     crops=detect(img)
 
-    sheet=get_sheet()
-
     found=[]
 
-    for i,c in enumerate(crops):
+    for c in crops:
 
         pimg=preprocess(c)
 
         text=ocr(pimg)
 
-        plates=plate(text)
+        plates=extract_plate(text)
 
-        b=img_to_bytes(c)
-
-        fname=f"cavet_{datetime.now().timestamp()}_{i}.jpg"
-
-        fid,link=upload(b,fname)
-
-        thumb=f'=IMAGE("https://drive.google.com/thumbnail?id={fid}&sz=w300")'
+        img_bytes=img_to_bytes(c)
 
         if not plates:
 
-            sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                chat,
-                name,
-                caption,
+            send_to_apps_script(
+                img_bytes,
                 "",
-                link,
-                thumb,
-                text,
-                "NO_PLATE"
-            ])
+                caption,
+                chat,
+                name
+            )
 
         else:
 
@@ -303,24 +192,16 @@ def process(file_id,chat,name,caption):
 
                 found.append(p)
 
-                sheet.append_row([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    chat,
-                    name,
-                    caption,
+                send_to_apps_script(
+                    img_bytes,
                     p,
-                    link,
-                    thumb,
-                    text,
-                    "OK"
-                ])
+                    caption,
+                    chat,
+                    name
+                )
 
     return found
 
-
-# =========================
-# WEBHOOK
-# =========================
 
 @app.route("/telegram/webhook",methods=["POST"])
 def webhook():
@@ -354,7 +235,7 @@ def webhook():
 
             plates=process(file_id,chat,name,caption)
 
-        elif "text" in msg:
+        else:
 
             send(chat,"📸 Gửi ảnh cà vẹt để quét")
 
@@ -362,7 +243,7 @@ def webhook():
 
         if plates:
 
-            send(chat,"✅ Đã quét:\n"+"\n".join(plates))
+            send(chat,"✅ Đã quét:\n"+ "\n".join(plates))
 
         else:
 
