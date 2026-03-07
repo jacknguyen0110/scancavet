@@ -17,15 +17,6 @@ TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
 
 REQUEST_TIMEOUT = 120
 
-# Regex chuẩn biển số dạng:
-# 29A-111.11 / 50F-054.23 / 31H-444.44
-PLATE_REGEXES = [
-    r"\b\d{2}[A-Z]-\d{3}\.\d{2}\b",
-    r"\b\d{2}[A-Z]\d{5}\b",
-    r"\b\d{2}[A-Z]\s?\d{3}\s?\d{2}\b",
-    r"\b\d{2}[A-Z]-?\d{3}[.\s]?\d{2}\b",
-]
-
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,7 +81,7 @@ def img_to_jpg_bytes(img: np.ndarray, quality: int = 95) -> bytes:
     return buf.tobytes()
 
 
-def resize_for_processing(img: np.ndarray, max_side: int = 2200):
+def resize_for_processing(img: np.ndarray, max_side: int = 2600):
     h, w = img.shape[:2]
     side = max(h, w)
     if side <= max_side:
@@ -104,92 +95,15 @@ def resize_for_processing(img: np.ndarray, max_side: int = 2200):
 
 
 # =========================
-# CARD SPLIT FOR MULTI-CARD IMAGE
+# GRID SPLIT
 # =========================
-def has_card_like_text(crop: np.ndarray) -> bool:
+def split_cards_grid_5x4(img: np.ndarray):
     """
-    OCR nhanh vùng trên/trái của crop để kiểm tra có phải cà vẹt không.
-    """
-    h, w = crop.shape[:2]
-    if h < 120 or w < 220:
-        return False
-
-    roi = crop[0:int(h * 0.45), 0:int(w * 0.75)]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    txt = pytesseract.image_to_string(gray, lang=TESS_LANG, config="--oem 3 --psm 6")
-    up = txt.upper()
-
-    keywords = [
-        "OWNER", "NUMBER PLATE", "BIEN SO", "VINFAST",
-        "CHASSIS", "ENGINE", "CTCP", "GSM"
-    ]
-    score = sum(1 for k in keywords if k in up)
-    return score >= 2
-
-
-def split_cards_grid(img: np.ndarray):
-    """
-    Ảnh nhiều cà vẹt thường theo lưới.
-    Thử các cấu hình lưới phổ biến rồi lọc bằng OCR nhẹ.
+    Ảnh collage 20 cà vẹt: chia cố định 5 hàng x 4 cột.
     """
     h, w = img.shape[:2]
-
-    # Ưu tiên cấu hình gần đúng với ảnh bạn gửi
-    grid_candidates = [
-        (5, 4),  # 20 thẻ
-        (4, 4),  # 16 thẻ
-        (5, 5),
-        (4, 5),
-        (6, 4),
-        (3, 4),
-    ]
-
-    best_crops = []
-    best_score = -1
-
-    for rows, cols in grid_candidates:
-        cell_h = h / rows
-        cell_w = w / cols
-        temp = []
-        score = 0
-
-        for r in range(rows):
-            for c in range(cols):
-                x1 = int(c * cell_w)
-                y1 = int(r * cell_h)
-                x2 = int((c + 1) * cell_w)
-                y2 = int((r + 1) * cell_h)
-
-                # cắt bớt mép để tránh viền trắng
-                pad_x = int((x2 - x1) * 0.03)
-                pad_y = int((y2 - y1) * 0.03)
-
-                x1p = min(max(0, x1 + pad_x), w)
-                y1p = min(max(0, y1 + pad_y), h)
-                x2p = min(max(0, x2 - pad_x), w)
-                y2p = min(max(0, y2 - pad_y), h)
-
-                crop = img[y1p:y2p, x1p:x2p]
-                if crop.size == 0:
-                    continue
-
-                ok = has_card_like_text(crop)
-                if ok:
-                    score += 1
-                temp.append((r, c, crop, ok))
-
-        if score > best_score:
-            best_score = score
-            best_crops = temp
-
-    valid = [x[2] for x in best_crops if x[3]]
-
-    # fallback nếu OCR check chưa nhận được nhiều
-    if len(valid) >= 4:
-        return valid
-
-    # fallback 2: dùng grid 5x4 luôn
     rows, cols = 5, 4
+
     cell_h = h / rows
     cell_w = w / cols
     crops = []
@@ -201,39 +115,48 @@ def split_cards_grid(img: np.ndarray):
             x2 = int((c + 1) * cell_w)
             y2 = int((r + 1) * cell_h)
 
-            pad_x = int((x2 - x1) * 0.03)
-            pad_y = int((y2 - y1) * 0.03)
+            # cắt bớt mép để tránh viền trắng
+            pad_x = int((x2 - x1) * 0.04)
+            pad_y = int((y2 - y1) * 0.04)
 
-            x1p = min(max(0, x1 + pad_x), w)
-            y1p = min(max(0, y1 + pad_y), h)
-            x2p = min(max(0, x2 - pad_x), w)
-            y2p = min(max(0, y2 - pad_y), h)
+            x1 = max(0, x1 + pad_x)
+            y1 = max(0, y1 + pad_y)
+            x2 = min(w, x2 - pad_x)
+            y2 = min(h, y2 - pad_y)
 
-            crop = img[y1p:y2p, x1p:x2p]
+            crop = img[y1:y2, x1:x2]
             if crop.size > 0:
                 crops.append(crop)
 
     return crops
 
 
-def detect_cards(img: np.ndarray):
+def looks_like_collage(img: np.ndarray) -> bool:
     """
-    Với ảnh nhiều cà vẹt: dùng grid split.
-    Với ảnh 1 cà vẹt: trả nguyên ảnh.
+    Nhận diện ảnh nhiều cà vẹt theo kích thước và tỷ lệ.
     """
     h, w = img.shape[:2]
+    ratio = w / float(h) if h else 0
 
-    # Nếu ảnh đủ lớn và có vẻ là collage nhiều thẻ thì split grid
-    if w > 1400 and h > 1800:
-        crops = split_cards_grid(img)
-        if len(crops) >= 4:
+    # ảnh bạn gửi gần kiểu 4 cột x 5 hàng
+    return (w >= 900 and h >= 1200 and 0.65 <= ratio <= 0.95)
+
+
+def detect_cards(img: np.ndarray):
+    """
+    - Nếu là ảnh collage: chia 5x4
+    - Nếu không: coi là 1 cà vẹt
+    """
+    if looks_like_collage(img):
+        crops = split_cards_grid_5x4(img)
+        if len(crops) == 20:
             return crops
 
     return [img]
 
 
 # =========================
-# OCR / PLATE
+# OCR
 # =========================
 def preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -261,6 +184,7 @@ def clean_text(text: str) -> str:
 def normalize_plate_to_compact(text: str) -> str:
     """
     29A-111.11 -> 29A11111
+    50F-054.23 -> 50F05423
     """
     x = text.upper()
     x = x.replace("O", "0")
@@ -272,27 +196,16 @@ def is_valid_plate_compact(text: str) -> bool:
     return bool(re.fullmatch(r"\d{2}[A-Z]\d{5}", text))
 
 
-def extract_plate_candidates(text: str):
-    raw = clean_text(text)
-    out = []
-
-    for pattern in PLATE_REGEXES:
-        matches = re.findall(pattern, raw)
-        for m in matches:
-            plate = normalize_plate_to_compact(m)
-            if is_valid_plate_compact(plate) and plate not in out:
-                out.append(plate)
-
-    return out
-
-
 def extract_plate_after_label(text: str):
+    """
+    Ưu tiên lấy biển số sau cụm Number Plate / Biển số.
+    """
     raw = clean_text(text)
 
     patterns = [
-        r"NUMBER\s*PLATE[^A-Z0-9]{0,40}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
-        r"BIEN\s*SO[^A-Z0-9]{0,40}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
-        r"BIỂN\s*SỐ[^A-Z0-9]{0,40}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
+        r"NUMBER\s*PLATE[^A-Z0-9]{0,50}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
+        r"BIEN\s*SO[^A-Z0-9]{0,50}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
+        r"BIỂN\s*SỐ[^A-Z0-9]{0,50}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
     ]
 
     for p in patterns:
@@ -305,27 +218,47 @@ def extract_plate_after_label(text: str):
     return None
 
 
+def extract_any_plate(text: str):
+    raw = clean_text(text)
+
+    patterns = [
+        r"\b\d{2}[A-Z]-\d{3}\.\d{2}\b",
+        r"\b\d{2}[A-Z]\d{5}\b",
+        r"\b\d{2}[A-Z]\s?\d{3}\s?\d{2}\b",
+        r"\b\d{2}[A-Z]-?\d{3}[.\s]?\d{2}\b",
+    ]
+
+    for p in patterns:
+        matches = re.findall(p, raw)
+        for item in matches:
+            plate = normalize_plate_to_compact(item)
+            if is_valid_plate_compact(plate):
+                return plate
+
+    return None
+
+
 def extract_plate_from_crop(card_img: np.ndarray):
     """
-    Chỉ trả về 1 biển số tốt nhất cho mỗi thẻ.
+    Chỉ trả về 1 biển số tốt nhất cho mỗi crop.
     """
     h, w = card_img.shape[:2]
     rois = []
 
-    # ROI biển số - nửa dưới bên trái
-    roi1 = card_img[int(h * 0.46):int(h * 0.93), 0:int(w * 0.63)]
+    # ROI vùng biển số
+    roi1 = card_img[int(h * 0.42):int(h * 0.95), 0:int(w * 0.70)]
     if roi1.size > 0:
         rois.append(roi1)
 
-    # ROI rộng hơn một chút
-    roi2 = card_img[int(h * 0.38):int(h * 0.95), int(w * 0.02):int(w * 0.80)]
+    # ROI rộng hơn
+    roi2 = card_img[int(h * 0.35):int(h * 0.98), 0:int(w * 0.85)]
     if roi2.size > 0:
         rois.append(roi2)
 
     # fallback toàn thẻ
     rois.append(card_img)
 
-    collected_texts = []
+    all_texts = []
 
     for roi in rois:
         txt1 = pytesseract.image_to_string(
@@ -333,24 +266,24 @@ def extract_plate_from_crop(card_img: np.ndarray):
             lang=TESS_LANG,
             config="--oem 3 --psm 6"
         )
-        collected_texts.append(txt1)
+        all_texts.append(txt1)
 
         txt2 = pytesseract.image_to_string(
             preprocess_for_ocr(roi),
             lang=TESS_LANG,
             config="--oem 3 --psm 6"
         )
-        collected_texts.append(txt2)
+        all_texts.append(txt2)
 
-        combined = "\n".join(collected_texts)
+        combined = "\n".join(all_texts)
 
         plate = extract_plate_after_label(combined)
         if plate:
             return plate
 
-        candidates = extract_plate_candidates(combined)
-        if candidates:
-            return candidates[0]
+        plate = extract_any_plate(combined)
+        if plate:
+            return plate
 
     return None
 
@@ -416,7 +349,7 @@ def send_to_apps_script(
 def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
     raw_bytes = download_telegram_file(file_id)
     img = bytes_to_img(raw_bytes)
-    img, _ = resize_for_processing(img, max_side=2200)
+    img, _ = resize_for_processing(img, max_side=2600)
 
     crops = detect_cards(img)
     logger.info("Detected crops: %s", len(crops))
@@ -445,8 +378,8 @@ def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
                 name=full_name
             )
 
-            saved_count += 1
             found_plates.append(plate)
+            saved_count += 1
 
         except Exception as e:
             logger.exception("Crop %s error: %s", idx, e)
