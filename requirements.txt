@@ -1,0 +1,11 @@
+Flask==3.0.3
+requests==2.32.3
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pytesseract==0.3.10
+gspread==6.1.2
+google-api-python-client==2.149.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+gunicorn==23.0.0
