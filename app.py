@@ -16,7 +16,6 @@ APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
 TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
 REQUEST_TIMEOUT = 120
 
-# chống xử lý lặp
 processed_update_ids = []
 processed_file_ids = []
 MAX_UPDATE_IDS = 5000
@@ -132,12 +131,12 @@ def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
 
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # top-left
-    rect[2] = pts[np.argmax(s)]   # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
 
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
 
     return rect
 
@@ -171,8 +170,8 @@ def four_point_transform(image, pts):
 
 def detect_rect_cards(img: np.ndarray):
     """
-    Dò từng cà vẹt rời nhau bằng contour/rectangle.
-    Hợp cho ảnh 2-6 thẻ.
+    Dò từng thẻ riêng.
+    Hợp với ảnh 2-6 thẻ rời nhau, hoặc cận cảnh 1 thẻ rõ viền.
     """
     original = img.copy()
     h0, w0 = original.shape[:2]
@@ -188,7 +187,7 @@ def detect_rect_cards(img: np.ndarray):
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_area = (work.shape[0] * work.shape[1]) * 0.02
+    min_area = (work.shape[0] * work.shape[1]) * 0.015
     candidates = []
 
     for cnt in contours:
@@ -211,14 +210,14 @@ def detect_rect_cards(img: np.ndarray):
             h, w = warped.shape[:2]
             ratio = w / float(h) if h else 0
 
-            if 1.10 <= ratio <= 2.6 and w >= 220 and h >= 120:
+            if 1.05 <= ratio <= 2.8 and w >= 220 and h >= 120:
                 x, y, _, _ = cv2.boundingRect(approx)
                 candidates.append((x, y, warped))
         else:
             x, y, w, h = cv2.boundingRect(cnt)
             ratio = w / float(h) if h else 0
 
-            if 1.10 <= ratio <= 2.6 and w >= 200 and h >= 120:
+            if 1.05 <= ratio <= 2.8 and w >= 220 and h >= 120:
                 ox = int(x / scale)
                 oy = int(y / scale)
                 ow = int(w / scale)
@@ -240,7 +239,6 @@ def detect_rect_cards(img: np.ndarray):
 
     results = []
     seen = set()
-
     for _, _, crop in candidates:
         h, w = crop.shape[:2]
         key = (round(w / 35), round(h / 35))
@@ -252,22 +250,118 @@ def detect_rect_cards(img: np.ndarray):
     return results
 
 
-def looks_like_collage(img: np.ndarray) -> bool:
+def looks_like_vertical_stack(img: np.ndarray) -> bool:
+    h, w = img.shape[:2]
+    ratio = h / float(w) if w else 0
+    return h >= 1000 and w >= 650 and ratio >= 1.15
+
+
+def split_vertical_stack(img: np.ndarray):
+    """
+    Chia ảnh xếp dọc 3-6 thẻ.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    _, th = cv2.threshold(blur, 185, 255, cv2.THRESH_BINARY)
+
+    proj = np.sum(th == 255, axis=1)
+    white_threshold = int(w * 0.28)
+    mask = proj > white_threshold
+
+    bands = []
+    in_band = False
+    start = 0
+
+    for i, val in enumerate(mask):
+        if val and not in_band:
+            start = i
+            in_band = True
+        elif not val and in_band:
+            end = i
+            if end - start > 100:
+                bands.append((start, end))
+            in_band = False
+
+    if in_band:
+        end = h
+        if end - start > 100:
+            bands.append((start, end))
+
+    crops = []
+    for y1, y2 in bands:
+        pad_y = int((y2 - y1) * 0.08)
+        yy1 = max(0, y1 - pad_y)
+        yy2 = min(h, y2 + pad_y)
+
+        band = img[yy1:yy2, :]
+        gray_band = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        _, th_band = cv2.threshold(gray_band, 170, 255, cv2.THRESH_BINARY)
+
+        proj_x = np.sum(th_band == 255, axis=0)
+        xmask = proj_x > int((yy2 - yy1) * 0.12)
+
+        xs = np.where(xmask)[0]
+        if len(xs) == 0:
+            continue
+
+        x1 = max(0, int(xs.min()) - 15)
+        x2 = min(w, int(xs.max()) + 15)
+
+        crop = img[yy1:yy2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        ch, cw = crop.shape[:2]
+        ratio = cw / float(ch) if ch else 0
+        if 1.05 <= ratio <= 2.8:
+            crops.append(crop)
+
+    return crops
+
+
+def is_true_grid_5x4(img: np.ndarray) -> bool:
+    """
+    Chỉ coi là collage khi thật sự có nhiều khe trắng theo cả trục dọc và ngang.
+    Tránh nhận nhầm ảnh cận cảnh hoặc ảnh stack dọc.
+    """
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
 
-    # chỉ nhận collage khi ảnh đủ lớn và gần đúng kiểu 20 ô
-    return (
-        w >= 850 and
-        h >= 1150 and
-        0.68 <= ratio <= 0.90
-    )
+    if not (w >= 850 and h >= 1150 and 0.68 <= ratio <= 0.90):
+        return False
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+
+    proj_y = np.sum(th == 255, axis=1)
+    proj_x = np.sum(th == 255, axis=0)
+
+    # tìm khe trắng đủ mạnh
+    y_peaks = proj_y > int(w * 0.92)
+    x_peaks = proj_x > int(h * 0.92)
+
+    # đếm số đoạn trắng liên tục
+    def count_runs(mask):
+        runs = 0
+        in_run = False
+        for v in mask:
+            if v and not in_run:
+                runs += 1
+                in_run = True
+            elif not v:
+                in_run = False
+        return runs
+
+    y_runs = count_runs(y_peaks)
+    x_runs = count_runs(x_peaks)
+
+    # grid 5x4 thường có nhiều khe ngang và dọc
+    return y_runs >= 4 and x_runs >= 3
 
 
 def split_cards_grid_5x4(img: np.ndarray):
-    """
-    Chia ảnh collage thành 20 ô.
-    """
     h, w = img.shape[:2]
     rows, cols = 5, 4
 
@@ -297,90 +391,12 @@ def split_cards_grid_5x4(img: np.ndarray):
     return crops
 
 
-def looks_like_vertical_stack(img: np.ndarray) -> bool:
-    h, w = img.shape[:2]
-    ratio = h / float(w) if w else 0
-
-    return (
-        h >= 1100 and
-        w >= 700 and
-        ratio >= 1.20
-    )
-
-
-def split_vertical_stack(img: np.ndarray):
-    """
-    Chia ảnh xếp dọc 3-6 cà vẹt.
-    """
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    _, th = cv2.threshold(blur, 185, 255, cv2.THRESH_BINARY)
-
-    proj = np.sum(th == 255, axis=1)
-
-    white_threshold = int(w * 0.32)
-    mask = proj > white_threshold
-
-    bands = []
-    in_band = False
-    start = 0
-
-    for i, val in enumerate(mask):
-        if val and not in_band:
-            start = i
-            in_band = True
-        elif not val and in_band:
-            end = i
-            if end - start > 120:
-                bands.append((start, end))
-            in_band = False
-
-    if in_band:
-        end = h
-        if end - start > 120:
-            bands.append((start, end))
-
-    crops = []
-    for y1, y2 in bands:
-        pad_y = int((y2 - y1) * 0.08)
-        yy1 = max(0, y1 - pad_y)
-        yy2 = min(h, y2 + pad_y)
-
-        band = img[yy1:yy2, :]
-        gray_band = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-        _, th_band = cv2.threshold(gray_band, 170, 255, cv2.THRESH_BINARY)
-
-        proj_x = np.sum(th_band == 255, axis=0)
-        xmask = proj_x > int((yy2 - yy1) * 0.15)
-
-        xs = np.where(xmask)[0]
-        if len(xs) == 0:
-            continue
-
-        x1 = max(0, int(xs.min()) - 15)
-        x2 = min(w, int(xs.max()) + 15)
-
-        crop = img[yy1:yy2, x1:x2]
-        if crop.size == 0:
-            continue
-
-        ch, cw = crop.shape[:2]
-        ratio = cw / float(ch) if ch else 0
-
-        if 1.10 <= ratio <= 2.6:
-            crops.append(crop)
-
-    return crops
-
-
 def detect_cards(img: np.ndarray):
     """
     Ưu tiên:
-    1) detect thẻ rời
+    1) detect thẻ rời / cận cảnh
     2) detect stack dọc
-    3) detect collage 5x4
+    3) detect collage thật
     4) fallback 1 thẻ
     """
     h, w = img.shape[:2]
@@ -398,7 +414,7 @@ def detect_cards(img: np.ndarray):
             logger.info("Vertical-stack detect -> %s crops", len(vertical_cards))
             return vertical_cards
 
-    if looks_like_collage(img):
+    if is_true_grid_5x4(img):
         crops = split_cards_grid_5x4(img)
         logger.info("Grid split 5x4 -> %s crops", len(crops))
         return crops
@@ -434,9 +450,6 @@ def clean_text(text: str) -> str:
 
 
 def normalize_plate_to_compact(text: str) -> str:
-    """
-    50H-318.75 -> 50H31875
-    """
     x = text.upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
