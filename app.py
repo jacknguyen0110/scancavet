@@ -8,9 +8,6 @@ import numpy as np
 import pytesseract
 from flask import Flask, request, jsonify
 
-# =========================
-# CONFIG
-# =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
 TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
@@ -64,7 +61,7 @@ def download_telegram_file(file_id: str) -> bytes:
 
 
 # =========================
-# IMAGE UTIL
+# IMAGE
 # =========================
 def bytes_to_img(image_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(image_bytes, np.uint8)
@@ -95,13 +92,9 @@ def resize_for_processing(img: np.ndarray, max_side: int = 1800):
 
 
 # =========================
-# DETECT CÀ VẸT
+# DETECT CARD
 # =========================
 def detect_cards(img: np.ndarray):
-    """
-    Tìm các vùng giống cà vẹt trong ảnh.
-    Nếu không tìm được thì fallback trả về toàn ảnh.
-    """
     original = img.copy()
     work, scale = resize_for_processing(img, max_side=1800)
 
@@ -146,10 +139,8 @@ def detect_cards(img: np.ndarray):
     if not candidates:
         return [original]
 
-    # sort trên -> dưới, trái -> phải
     candidates.sort(key=lambda x: (x[1], x[0]))
 
-    # bỏ duplicate gần giống nhau theo kích thước
     results = []
     seen = set()
     for _, _, crop in candidates:
@@ -180,40 +171,53 @@ def preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
     return th
 
 
-def normalize_plate_raw(text: str) -> str:
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
     x = text.upper()
-    x = x.replace("O", "0")
-    x = x.replace("I", "1")
-    x = x.replace("L", "1")
-    x = x.replace(",", ".")
     x = x.replace("–", "-").replace("—", "-")
-    x = re.sub(r"\s+", "", x)
-    x = re.sub(r"[^0-9A-Z\.-]", "", x)
+    x = x.replace(",", ".")
     return x
 
 
-def normalize_plate_digits(candidate: str) -> str:
+def normalize_plate_to_compact(text: str) -> str:
     """
     50F-054.23 -> 50F05423
-    50F054.23 -> 50F05423
-    50F 054 23 -> 50F05423
     """
-    x = candidate.upper()
+    x = text.upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
     return x
 
 
-def find_best_plate(text: str):
-    """
-    Chỉ nhận đúng dạng:
-    2 số + 1 chữ + 5 số
-    ví dụ 50F05423
-    """
-    if not text:
-        return None
+def is_valid_plate_compact(text: str) -> bool:
+    return bool(re.fullmatch(r"\d{2}[A-Z]\d{5}", text))
 
-    raw = normalize_plate_raw(text)
+
+def extract_plate_after_number_plate_label(text: str):
+    """
+    Ưu tiên bắt biển số nằm ngay sau cụm Number Plate / Biển số đăng ký.
+    """
+    raw = clean_text(text)
+
+    patterns = [
+        r"NUMBER\s*PLATE[^A-Z0-9]{0,30}(\d{2}[A-Z]\s?-?\s?\d{3}[.\s]?\d{2})",
+        r"BIEN\s*SO[^A-Z0-9]{0,30}(\d{2}[A-Z]\s?-?\s?\d{3}[.\s]?\d{2})",
+        r"BIỂN\s*SỐ[^A-Z0-9]{0,30}(\d{2}[A-Z]\s?-?\s?\d{3}[.\s]?\d{2})",
+    ]
+
+    for p in patterns:
+        m = re.search(p, raw, flags=re.IGNORECASE)
+        if m:
+            plate = normalize_plate_to_compact(m.group(1))
+            if is_valid_plate_compact(plate):
+                return plate
+
+    return None
+
+
+def extract_any_valid_plate(text: str):
+    raw = clean_text(text)
 
     patterns = [
         r"\b\d{2}[A-Z]-?\d{3}\.?\d{2}\b",
@@ -221,40 +225,34 @@ def find_best_plate(text: str):
         r"\b\d{2}[A-Z]\s?\d{3}\s?\d{2}\b",
     ]
 
-    candidates = []
+    found = []
     for p in patterns:
-        candidates.extend(re.findall(p, raw))
+        found.extend(re.findall(p, raw))
 
-    normalized = []
-    for c in candidates:
-        n = normalize_plate_digits(c)
-        if re.fullmatch(r"\d{2}[A-Z]\d{5}", n):
-            normalized.append(n)
+    for item in found:
+        plate = normalize_plate_to_compact(item)
+        if is_valid_plate_compact(plate):
+            return plate
 
-    if not normalized:
-        return None
-
-    return normalized[0]
+    return None
 
 
 def extract_plate_from_crop(card_img: np.ndarray):
     """
-    Ưu tiên OCR vùng dưới bên trái để tránh đọc nhầm số khác.
+    Chỉ trả về 1 biển số tốt nhất.
+    Không trả full OCR.
     """
     h, w = card_img.shape[:2]
     rois = []
 
-    # vùng biển số thường ở nửa dưới bên trái
     roi1 = card_img[int(h * 0.45):int(h * 0.92), 0:int(w * 0.62)]
     if roi1.size > 0:
         rois.append(roi1)
 
-    # mở rộng thêm một chút
     roi2 = card_img[int(h * 0.40):int(h * 0.90), int(w * 0.03):int(w * 0.75)]
     if roi2.size > 0:
         rois.append(roi2)
 
-    # fallback toàn card
     rois.append(card_img)
 
     collected_texts = []
@@ -267,20 +265,23 @@ def extract_plate_from_crop(card_img: np.ndarray):
         )
         collected_texts.append(txt1)
 
-        pre = preprocess_for_ocr(roi)
         txt2 = pytesseract.image_to_string(
-            pre,
+            preprocess_for_ocr(roi),
             lang=TESS_LANG,
             config="--oem 3 --psm 6"
         )
         collected_texts.append(txt2)
 
         combined = "\n".join(collected_texts)
-        plate = find_best_plate(combined)
-        if plate:
-            return plate, combined
 
-    return None, "\n".join(collected_texts)
+        # Ưu tiên đúng nhãn Number Plate
+        plate = extract_plate_after_number_plate_label(combined)
+        if plate:
+            return plate
+
+    # fallback cuối cùng
+    combined = "\n".join(collected_texts)
+    return extract_any_valid_plate(combined)
 
 
 # =========================
@@ -291,8 +292,7 @@ def send_to_apps_script(
     plate: str,
     caption: str,
     chat_id: int,
-    name: str,
-    ocr_text: str
+    name: str
 ):
     if not APPS_SCRIPT_URL:
         raise Exception("Thiếu APPS_SCRIPT_URL")
@@ -302,8 +302,7 @@ def send_to_apps_script(
         "plate": plate or "",
         "caption": caption or "",
         "chatId": str(chat_id),
-        "name": name or "",
-        "ocrText": ocr_text or ""
+        "name": name or ""
     }
 
     r = requests.post(
@@ -341,7 +340,7 @@ def send_to_apps_script(
 
 
 # =========================
-# MAIN PROCESS
+# MAIN
 # =========================
 def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
     raw_bytes = download_telegram_file(file_id)
@@ -352,7 +351,12 @@ def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
     saved_count = 0
 
     for crop in crops:
-        plate, ocr_text = extract_plate_from_crop(crop)
+        plate = extract_plate_from_crop(crop)
+
+        # chỉ lưu crop có đọc ra biển số
+        if not plate:
+            continue
+
         crop_bytes = img_to_jpg_bytes(crop)
 
         send_to_apps_script(
@@ -360,21 +364,18 @@ def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
             plate=plate,
             caption=caption,
             chat_id=chat_id,
-            name=full_name,
-            ocr_text=ocr_text
+            name=full_name
         )
 
         saved_count += 1
-        if plate:
-            found_plates.append(plate)
+        found_plates.append(plate)
 
-    # unique nhưng giữ thứ tự
     found_plates = list(dict.fromkeys(found_plates))
     return found_plates, saved_count
 
 
 # =========================
-# FLASK ROUTES
+# FLASK
 # =========================
 @app.route("/", methods=["GET"])
 def home():
@@ -426,8 +427,7 @@ def telegram_webhook():
         else:
             send_message(
                 chat_id,
-                "⚠️ Đã lưu ảnh crop nhưng chưa đọc chắc chắn ra biển số.\n"
-                f"Số ảnh crop đã lưu: {saved_count}"
+                "⚠️ Chưa đọc chắc chắn ra biển số nên không ghi vào Drive/Sheet."
             )
 
         return "ok", 200
@@ -447,14 +447,9 @@ def telegram_webhook():
         return "ok", 200
 
 
-# =========================
-# START
-# =========================
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN")
-    if not APPS_SCRIPT_URL:
-        logger.warning("Thiếu APPS_SCRIPT_URL")
 
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
