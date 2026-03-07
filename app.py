@@ -95,11 +95,23 @@ def resize_for_processing(img: np.ndarray, max_side: int = 2600):
 
 
 # =========================
-# GRID SPLIT
+# CARD DETECTION
 # =========================
+def looks_like_collage(img: np.ndarray) -> bool:
+    h, w = img.shape[:2]
+    ratio = w / float(h) if h else 0
+
+    # Nới điều kiện để bắt đúng ảnh ghép Telegram preview / document
+    return (
+        w >= 700 and
+        h >= 900 and
+        0.65 <= ratio <= 1.05
+    )
+
+
 def split_cards_grid_5x4(img: np.ndarray):
     """
-    Ảnh collage 20 cà vẹt: chia cố định 5 hàng x 4 cột.
+    Cắt cố định 5 hàng x 4 cột cho ảnh ghép 20 thẻ.
     """
     h, w = img.shape[:2]
     rows, cols = 5, 4
@@ -115,9 +127,9 @@ def split_cards_grid_5x4(img: np.ndarray):
             x2 = int((c + 1) * cell_w)
             y2 = int((r + 1) * cell_h)
 
-            # cắt bớt mép để tránh viền trắng
-            pad_x = int((x2 - x1) * 0.04)
-            pad_y = int((y2 - y1) * 0.04)
+            # cắt nhẹ mép ngoài
+            pad_x = int((x2 - x1) * 0.02)
+            pad_y = int((y2 - y1) * 0.02)
 
             x1 = max(0, x1 + pad_x)
             y1 = max(0, y1 + pad_y)
@@ -131,27 +143,21 @@ def split_cards_grid_5x4(img: np.ndarray):
     return crops
 
 
-def looks_like_collage(img: np.ndarray) -> bool:
+def detect_cards(img: np.ndarray):
     """
-    Nhận diện ảnh nhiều cà vẹt theo kích thước và tỷ lệ.
+    - Ảnh ghép: chia 5x4
+    - Ảnh thường: 1 crop
     """
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
+    logger.info("Image size: w=%s h=%s ratio=%.3f", w, h, ratio)
 
-    # ảnh bạn gửi gần kiểu 4 cột x 5 hàng
-    return (w >= 900 and h >= 1200 and 0.65 <= ratio <= 0.95)
-
-
-def detect_cards(img: np.ndarray):
-    """
-    - Nếu là ảnh collage: chia 5x4
-    - Nếu không: coi là 1 cà vẹt
-    """
     if looks_like_collage(img):
         crops = split_cards_grid_5x4(img)
-        if len(crops) == 20:
-            return crops
+        logger.info("Grid split 5x4 -> %s crops", len(crops))
+        return crops
 
+    logger.info("Single-card mode")
     return [img]
 
 
@@ -197,9 +203,6 @@ def is_valid_plate_compact(text: str) -> bool:
 
 
 def extract_plate_after_label(text: str):
-    """
-    Ưu tiên lấy biển số sau cụm Number Plate / Biển số.
-    """
     raw = clean_text(text)
 
     patterns = [
@@ -245,7 +248,7 @@ def extract_plate_from_crop(card_img: np.ndarray):
     h, w = card_img.shape[:2]
     rois = []
 
-    # ROI vùng biển số
+    # ROI chính: vùng biển số phía dưới bên trái
     roi1 = card_img[int(h * 0.42):int(h * 0.95), 0:int(w * 0.70)]
     if roi1.size > 0:
         rois.append(roi1)
@@ -255,7 +258,7 @@ def extract_plate_from_crop(card_img: np.ndarray):
     if roi2.size > 0:
         rois.append(roi2)
 
-    # fallback toàn thẻ
+    # fallback: toàn thẻ
     rois.append(card_img)
 
     all_texts = []
