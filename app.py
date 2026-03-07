@@ -16,7 +16,7 @@ APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
 TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
 REQUEST_TIMEOUT = 120
 
-# cache chống xử lý lặp
+# chống xử lý lặp
 processed_update_ids = []
 processed_file_ids = []
 MAX_UPDATE_IDS = 5000
@@ -127,6 +127,131 @@ def resize_for_processing(img: np.ndarray, max_side: int = 2600):
 # =========================
 # CARD DETECTION
 # =========================
+def order_points(pts):
+    pts = np.array(pts, dtype="float32")
+    rect = np.zeros((4, 2), dtype="float32")
+
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+
+    return rect
+
+
+def four_point_transform(image, pts):
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = max(int(width_a), int(width_b))
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = max(int(height_a), int(height_b))
+
+    if max_width < 50 or max_height < 50:
+        return None
+
+    dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1]
+    ], dtype="float32")
+
+    m = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, m, (max_width, max_height))
+    return warped
+
+
+def detect_rect_cards(img: np.ndarray):
+    """
+    Dò từng cà vẹt riêng lẻ bằng contour/rectangle.
+    Hợp cho ảnh 2-6 thẻ rời nhau.
+    """
+    original = img.copy()
+    h0, w0 = original.shape[:2]
+
+    work, scale = resize_for_processing(original, max_side=1800)
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, kernel, iterations=2)
+    edges = cv2.erode(edges, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    min_area = (work.shape[0] * work.shape[1]) * 0.03
+    candidates = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype("float32")
+            pts[:, 0] /= scale
+            pts[:, 1] /= scale
+
+            warped = four_point_transform(original, pts)
+            if warped is None:
+                continue
+
+            h, w = warped.shape[:2]
+            ratio = w / float(h) if h else 0
+
+            if 1.15 <= ratio <= 2.4 and w >= 250 and h >= 140:
+                x, y, bw, bh = cv2.boundingRect(approx)
+                candidates.append((x, y, warped))
+        else:
+            x, y, w, h = cv2.boundingRect(cnt)
+            ratio = w / float(h) if h else 0
+
+            if 1.15 <= ratio <= 2.4 and w >= 220 and h >= 140:
+                ox = int(x / scale)
+                oy = int(y / scale)
+                ow = int(w / scale)
+                oh = int(h / scale)
+
+                ox = max(0, ox)
+                oy = max(0, oy)
+                ow = min(w0 - ox, ow)
+                oh = min(h0 - oy, oh)
+
+                crop = original[oy:oy + oh, ox:ox + ow]
+                if crop.size > 0:
+                    candidates.append((ox, oy, crop))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda t: (t[1], t[0]))
+
+    results = []
+    seen = set()
+
+    for _, _, crop in candidates:
+        h, w = crop.shape[:2]
+        key = (round(w / 40), round(h / 40))
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(crop)
+
+    return results
+
+
 def looks_like_collage(img: np.ndarray) -> bool:
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
@@ -139,6 +264,9 @@ def looks_like_collage(img: np.ndarray) -> bool:
 
 
 def split_cards_grid_5x4(img: np.ndarray):
+    """
+    Chia cố định ảnh collage thành 20 ô.
+    """
     h, w = img.shape[:2]
     rows, cols = 5, 4
 
@@ -169,9 +297,20 @@ def split_cards_grid_5x4(img: np.ndarray):
 
 
 def detect_cards(img: np.ndarray):
+    """
+    Ưu tiên:
+    1) detect từng thẻ riêng
+    2) nếu là ảnh collage thì chia 5x4
+    3) fallback 1 thẻ
+    """
     h, w = img.shape[:2]
     ratio = w / float(h) if h else 0
     logger.info("Image size: w=%s h=%s ratio=%.3f", w, h, ratio)
+
+    rect_cards = detect_rect_cards(img)
+    if len(rect_cards) >= 2:
+        logger.info("Rect-card detect -> %s crops", len(rect_cards))
+        return rect_cards
 
     if looks_like_collage(img):
         crops = split_cards_grid_5x4(img)
@@ -209,6 +348,9 @@ def clean_text(text: str) -> str:
 
 
 def normalize_plate_to_compact(text: str) -> str:
+    """
+    50G-018.74 -> 50G01874
+    """
     x = text.upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
@@ -259,6 +401,9 @@ def extract_any_plate(text: str):
 
 
 def extract_plate_from_crop(card_img: np.ndarray):
+    """
+    Chỉ trả về 1 biển số tốt nhất cho mỗi thẻ.
+    """
     h, w = card_img.shape[:2]
     rois = []
 
@@ -374,7 +519,8 @@ def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
     for idx, crop in enumerate(crops, start=1):
         try:
             plate = extract_plate_from_crop(crop)
-            logger.info("Crop %s plate: %s", idx, plate)
+            if plate:
+                logger.info("Crop %s OK: %s", idx, plate)
 
             if not plate:
                 continue
