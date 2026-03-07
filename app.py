@@ -1,21 +1,26 @@
 import os
 import re
 import cv2
+import json
+import time
 import base64
 import logging
 import requests
 import numpy as np
-import pytesseract
 from flask import Flask, request, jsonify
 
 # =========================
-# CONFIG
+# ENV
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
-TESS_LANG = os.getenv("TESS_LANG", "vie+eng").strip()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+
 REQUEST_TIMEOUT = 120
 
+# chống xử lý lặp
 processed_update_ids = []
 processed_file_ids = []
 MAX_UPDATE_IDS = 5000
@@ -49,6 +54,15 @@ def is_duplicate_update(update_id):
 
 def is_duplicate_file(file_id):
     return file_id in processed_file_ids
+
+
+def is_stale_message(msg, max_age_seconds=180):
+    msg_date = msg.get("date")
+    if not msg_date:
+        return False
+    now_ts = int(time.time())
+    age = now_ts - int(msg_date)
+    return age > max_age_seconds
 
 
 # =========================
@@ -93,466 +107,161 @@ def download_telegram_file(file_id: str) -> bytes:
 
 
 # =========================
-# IMAGE
+# IMAGE UTILS
 # =========================
-def bytes_to_img(image_bytes: bytes) -> np.ndarray:
+def bytes_to_img(image_bytes: bytes):
     arr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise Exception("Không decode được ảnh đầu vào")
+        raise Exception("Không decode được ảnh")
     return img
 
 
-def img_to_jpg_bytes(img: np.ndarray, quality: int = 95) -> bytes:
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+def normalize_for_model(image_bytes: bytes, max_side: int = 1800, jpg_quality: int = 90) -> bytes:
+    """
+    Giảm kích thước hợp lý trước khi gửi GPT Vision để nhanh và rẻ hơn.
+    """
+    img = bytes_to_img(image_bytes)
+    h, w = img.shape[:2]
+    side = max(h, w)
+
+    if side > max_side:
+        scale = max_side / float(side)
+        nw = int(w * scale)
+        nh = int(h * scale)
+        img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_quality])
     if not ok:
         raise Exception("Không encode được ảnh JPG")
     return buf.tobytes()
 
 
-def resize_for_processing(img: np.ndarray, max_side: int = 2600):
-    h, w = img.shape[:2]
-    side = max(h, w)
-    if side <= max_side:
-        return img.copy(), 1.0
-
-    scale = max_side / float(side)
-    nw = int(w * scale)
-    nh = int(h * scale)
-    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-    return resized, scale
-
-
 # =========================
-# CARD DETECTION
+# PLATE NORMALIZATION
 # =========================
-def order_points(pts):
-    pts = np.array(pts, dtype="float32")
-    rect = np.zeros((4, 2), dtype="float32")
-
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-
-    return rect
-
-
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b))
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b))
-
-    if max_width < 50 or max_height < 50:
-        return None
-
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1]
-    ], dtype="float32")
-
-    m = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, m, (max_width, max_height))
-    return warped
-
-
-def detect_rect_cards(img: np.ndarray):
-    """
-    Dò từng thẻ riêng.
-    Hợp với ảnh 2-6 thẻ rời nhau, hoặc cận cảnh 1 thẻ rõ viền.
-    """
-    original = img.copy()
-    h0, w0 = original.shape[:2]
-
-    work, scale = resize_for_processing(original, max_side=1800)
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    edges = cv2.Canny(blur, 50, 150)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.dilate(edges, kernel, iterations=2)
-    edges = cv2.erode(edges, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    min_area = (work.shape[0] * work.shape[1]) * 0.015
-    candidates = []
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area:
-            continue
-
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
-
-        if len(approx) == 4:
-            pts = approx.reshape(4, 2).astype("float32")
-            pts[:, 0] /= scale
-            pts[:, 1] /= scale
-
-            warped = four_point_transform(original, pts)
-            if warped is None:
-                continue
-
-            h, w = warped.shape[:2]
-            ratio = w / float(h) if h else 0
-
-            if 1.05 <= ratio <= 2.8 and w >= 220 and h >= 120:
-                x, y, _, _ = cv2.boundingRect(approx)
-                candidates.append((x, y, warped))
-        else:
-            x, y, w, h = cv2.boundingRect(cnt)
-            ratio = w / float(h) if h else 0
-
-            if 1.05 <= ratio <= 2.8 and w >= 220 and h >= 120:
-                ox = int(x / scale)
-                oy = int(y / scale)
-                ow = int(w / scale)
-                oh = int(h / scale)
-
-                ox = max(0, ox)
-                oy = max(0, oy)
-                ow = min(w0 - ox, ow)
-                oh = min(h0 - oy, oh)
-
-                crop = original[oy:oy + oh, ox:ox + ow]
-                if crop.size > 0:
-                    candidates.append((ox, oy, crop))
-
-    if not candidates:
-        return []
-
-    candidates.sort(key=lambda t: (t[1], t[0]))
-
-    results = []
-    seen = set()
-    for _, _, crop in candidates:
-        h, w = crop.shape[:2]
-        key = (round(w / 35), round(h / 35))
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(crop)
-
-    return results
-
-
-def looks_like_vertical_stack(img: np.ndarray) -> bool:
-    h, w = img.shape[:2]
-    ratio = h / float(w) if w else 0
-    return h >= 1000 and w >= 650 and ratio >= 1.15
-
-
-def split_vertical_stack(img: np.ndarray):
-    """
-    Chia ảnh xếp dọc 3-6 thẻ.
-    """
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    _, th = cv2.threshold(blur, 185, 255, cv2.THRESH_BINARY)
-
-    proj = np.sum(th == 255, axis=1)
-    white_threshold = int(w * 0.28)
-    mask = proj > white_threshold
-
-    bands = []
-    in_band = False
-    start = 0
-
-    for i, val in enumerate(mask):
-        if val and not in_band:
-            start = i
-            in_band = True
-        elif not val and in_band:
-            end = i
-            if end - start > 100:
-                bands.append((start, end))
-            in_band = False
-
-    if in_band:
-        end = h
-        if end - start > 100:
-            bands.append((start, end))
-
-    crops = []
-    for y1, y2 in bands:
-        pad_y = int((y2 - y1) * 0.08)
-        yy1 = max(0, y1 - pad_y)
-        yy2 = min(h, y2 + pad_y)
-
-        band = img[yy1:yy2, :]
-        gray_band = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-        _, th_band = cv2.threshold(gray_band, 170, 255, cv2.THRESH_BINARY)
-
-        proj_x = np.sum(th_band == 255, axis=0)
-        xmask = proj_x > int((yy2 - yy1) * 0.12)
-
-        xs = np.where(xmask)[0]
-        if len(xs) == 0:
-            continue
-
-        x1 = max(0, int(xs.min()) - 15)
-        x2 = min(w, int(xs.max()) + 15)
-
-        crop = img[yy1:yy2, x1:x2]
-        if crop.size == 0:
-            continue
-
-        ch, cw = crop.shape[:2]
-        ratio = cw / float(ch) if ch else 0
-        if 1.05 <= ratio <= 2.8:
-            crops.append(crop)
-
-    return crops
-
-
-def is_true_grid_5x4(img: np.ndarray) -> bool:
-    """
-    Chỉ coi là collage khi thật sự có nhiều khe trắng theo cả trục dọc và ngang.
-    Tránh nhận nhầm ảnh cận cảnh hoặc ảnh stack dọc.
-    """
-    h, w = img.shape[:2]
-    ratio = w / float(h) if h else 0
-
-    if not (w >= 850 and h >= 1150 and 0.68 <= ratio <= 0.90):
-        return False
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, th = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
-
-    proj_y = np.sum(th == 255, axis=1)
-    proj_x = np.sum(th == 255, axis=0)
-
-    # tìm khe trắng đủ mạnh
-    y_peaks = proj_y > int(w * 0.92)
-    x_peaks = proj_x > int(h * 0.92)
-
-    # đếm số đoạn trắng liên tục
-    def count_runs(mask):
-        runs = 0
-        in_run = False
-        for v in mask:
-            if v and not in_run:
-                runs += 1
-                in_run = True
-            elif not v:
-                in_run = False
-        return runs
-
-    y_runs = count_runs(y_peaks)
-    x_runs = count_runs(x_peaks)
-
-    # grid 5x4 thường có nhiều khe ngang và dọc
-    return y_runs >= 4 and x_runs >= 3
-
-
-def split_cards_grid_5x4(img: np.ndarray):
-    h, w = img.shape[:2]
-    rows, cols = 5, 4
-
-    cell_h = h / rows
-    cell_w = w / cols
-    crops = []
-
-    for r in range(rows):
-        for c in range(cols):
-            x1 = int(c * cell_w)
-            y1 = int(r * cell_h)
-            x2 = int((c + 1) * cell_w)
-            y2 = int((r + 1) * cell_h)
-
-            pad_x = int((x2 - x1) * 0.02)
-            pad_y = int((y2 - y1) * 0.02)
-
-            x1 = max(0, x1 + pad_x)
-            y1 = max(0, y1 + pad_y)
-            x2 = min(w, x2 - pad_x)
-            y2 = min(h, y2 - pad_y)
-
-            crop = img[y1:y2, x1:x2]
-            if crop.size > 0:
-                crops.append(crop)
-
-    return crops
-
-
-def detect_cards(img: np.ndarray):
-    """
-    Ưu tiên:
-    1) detect thẻ rời / cận cảnh
-    2) detect stack dọc
-    3) detect collage thật
-    4) fallback 1 thẻ
-    """
-    h, w = img.shape[:2]
-    ratio = w / float(h) if h else 0
-    logger.info("Image size: w=%s h=%s ratio=%.3f", w, h, ratio)
-
-    rect_cards = detect_rect_cards(img)
-    if len(rect_cards) >= 2:
-        logger.info("Rect-card detect -> %s crops", len(rect_cards))
-        return rect_cards
-
-    if looks_like_vertical_stack(img):
-        vertical_cards = split_vertical_stack(img)
-        if len(vertical_cards) >= 2:
-            logger.info("Vertical-stack detect -> %s crops", len(vertical_cards))
-            return vertical_cards
-
-    if is_true_grid_5x4(img):
-        crops = split_cards_grid_5x4(img)
-        logger.info("Grid split 5x4 -> %s crops", len(crops))
-        return crops
-
-    logger.info("Single-card mode")
-    return [img]
-
-
-# =========================
-# OCR
-# =========================
-def preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    th = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        15
-    )
-    return th
-
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    x = text.upper()
-    x = x.replace("–", "-").replace("—", "-")
-    x = x.replace(",", ".")
-    return x
-
-
-def normalize_plate_to_compact(text: str) -> str:
-    x = text.upper()
+def normalize_plate(text: str) -> str:
+    x = (text or "").upper()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
     return x
 
 
-def is_valid_plate_compact(text: str) -> bool:
+def is_valid_plate(text: str) -> bool:
     return bool(re.fullmatch(r"\d{2}[A-Z]\d{5}", text))
 
 
-def extract_plate_after_label(text: str):
-    raw = clean_text(text)
-
-    patterns = [
-        r"NUMBER\s*PLATE[^A-Z0-9]{0,50}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
-        r"BIEN\s*SO[^A-Z0-9]{0,50}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
-        r"BIỂN\s*SỐ[^A-Z0-9]{0,50}(\d{2}[A-Z]-?\d{3}[.\s]?\d{2})",
-    ]
-
-    for p in patterns:
-        m = re.search(p, raw, flags=re.IGNORECASE)
-        if m:
-            plate = normalize_plate_to_compact(m.group(1))
-            if is_valid_plate_compact(plate):
-                return plate
-
-    return None
+def postprocess_plates(plates):
+    out = []
+    for p in plates or []:
+        n = normalize_plate(str(p))
+        if is_valid_plate(n) and n not in out:
+            out.append(n)
+    return out
 
 
-def extract_any_plate(text: str):
-    raw = clean_text(text)
+# =========================
+# OPENAI VISION
+# =========================
+def extract_plates_with_gpt(image_bytes: bytes):
+    if not OPENAI_API_KEY:
+        raise Exception("Thiếu OPENAI_API_KEY")
 
-    patterns = [
-        r"\b\d{2}[A-Z]-\d{3}\.\d{2}\b",
-        r"\b\d{2}[A-Z]\d{5}\b",
-        r"\b\d{2}[A-Z]\s?\d{3}\s?\d{2}\b",
-        r"\b\d{2}[A-Z]-?\d{3}[.\s]?\d{2}\b",
-    ]
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{image_b64}"
 
-    for p in patterns:
-        matches = re.findall(p, raw)
-        for item in matches:
-            plate = normalize_plate_to_compact(item)
-            if is_valid_plate_compact(plate):
-                return plate
+    schema = {
+        "name": "plate_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "plates": {
+                    "type": "array",
+                    "description": "Danh sách biển số xe nhìn thấy rõ trong ảnh, chuẩn hóa dạng 50H31875",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["plates"],
+            "additionalProperties": False
+        }
+    }
 
-    return None
+    prompt = (
+        "Bạn là hệ thống trích xuất biển số từ ảnh cà vẹt xe Việt Nam.\n"
+        "Nhiệm vụ:\n"
+        "1. Chỉ lấy biển số nhìn thấy rõ trên cà vẹt trong ảnh.\n"
+        "2. Ưu tiên dòng gần nhãn 'Number Plate' hoặc 'Biển số đăng ký'.\n"
+        "3. Trả biển số dạng liền không dấu gạch/chấm, ví dụ: 50H31875.\n"
+        "4. Nếu ảnh có nhiều cà vẹt, trả tất cả biển số nhìn thấy rõ.\n"
+        "5. Không đoán. Không bịa. Nếu không chắc thì bỏ qua.\n"
+        "6. Không trả text giải thích, chỉ trả JSON đúng schema."
+    )
 
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Bạn trích xuất biển số từ ảnh và trả JSON chính xác."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url
+                        }
+                    }
+                ]
+            }
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": schema
+        },
+        "temperature": 0
+    }
 
-def extract_plate_from_crop(card_img: np.ndarray):
-    h, w = card_img.shape[:2]
-    rois = []
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT
+    )
 
-    roi1 = card_img[int(h * 0.42):int(h * 0.95), 0:int(w * 0.70)]
-    if roi1.size > 0:
-        rois.append(roi1)
+    if r.status_code != 200:
+        raise Exception(f"OpenAI HTTP {r.status_code}: {r.text[:1000]}")
 
-    roi2 = card_img[int(h * 0.35):int(h * 0.98), 0:int(w * 0.85)]
-    if roi2.size > 0:
-        rois.append(roi2)
+    data = r.json()
+    content = data["choices"][0]["message"]["content"]
 
-    rois.append(card_img)
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        raise Exception(f"OpenAI không trả JSON hợp lệ: {content[:1000]}")
 
-    all_texts = []
-
-    for roi in rois:
-        txt1 = pytesseract.image_to_string(
-            roi,
-            lang=TESS_LANG,
-            config="--oem 3 --psm 6"
-        )
-        all_texts.append(txt1)
-
-        txt2 = pytesseract.image_to_string(
-            preprocess_for_ocr(roi),
-            lang=TESS_LANG,
-            config="--oem 3 --psm 6"
-        )
-        all_texts.append(txt2)
-
-        combined = "\n".join(all_texts)
-
-        plate = extract_plate_after_label(combined)
-        if plate:
-            return plate
-
-        plate = extract_any_plate(combined)
-        if plate:
-            return plate
-
-    return None
+    plates = postprocess_plates(parsed.get("plates", []))
+    return plates
 
 
 # =========================
 # APPS SCRIPT
 # =========================
-def send_to_apps_script(img_bytes: bytes, plate: str, caption: str, chat_id: int, name: str):
+def send_to_apps_script(image_bytes: bytes, plates, caption: str, chat_id: int, name: str):
     if not APPS_SCRIPT_URL:
         raise Exception("Thiếu APPS_SCRIPT_URL")
 
     payload = {
-        "image": base64.b64encode(img_bytes).decode("utf-8"),
-        "plate": plate or "",
+        "image": base64.b64encode(image_bytes).decode("utf-8"),
+        "plates": plates or [],
         "caption": caption or "",
         "chatId": str(chat_id),
         "name": name or ""
@@ -596,45 +305,22 @@ def send_to_apps_script(img_bytes: bytes, plate: str, caption: str, chat_id: int
 # MAIN
 # =========================
 def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
-    raw_bytes = download_telegram_file(file_id)
-    img = bytes_to_img(raw_bytes)
-    img, _ = resize_for_processing(img, max_side=2600)
+    original_bytes = download_telegram_file(file_id)
+    model_bytes = normalize_for_model(original_bytes)
 
-    crops = detect_cards(img)
-    logger.info("Detected crops: %s", len(crops))
+    plates = extract_plates_with_gpt(model_bytes)
+    logger.info("GPT plates: %s", plates)
 
-    found_plates = []
-    saved_count = 0
+    if plates:
+        send_to_apps_script(
+            image_bytes=original_bytes,   # lưu ảnh gốc lên Drive
+            plates=plates,
+            caption=caption,
+            chat_id=chat_id,
+            name=full_name
+        )
 
-    for idx, crop in enumerate(crops, start=1):
-        try:
-            plate = extract_plate_from_crop(crop)
-            if plate:
-                logger.info("Crop %s OK: %s", idx, plate)
-
-            if not plate:
-                continue
-
-            if plate in found_plates:
-                continue
-
-            crop_bytes = img_to_jpg_bytes(crop)
-
-            send_to_apps_script(
-                img_bytes=crop_bytes,
-                plate=plate,
-                caption=caption,
-                chat_id=chat_id,
-                name=full_name
-            )
-
-            found_plates.append(plate)
-            saved_count += 1
-
-        except Exception as e:
-            logger.exception("Crop %s error: %s", idx, e)
-
-    return found_plates, saved_count
+    return plates
 
 
 # =========================
@@ -660,6 +346,10 @@ def telegram_webhook():
 
         msg = data.get("message") or data.get("edited_message")
         if not msg:
+            return "ok", 200
+
+        if is_stale_message(msg, max_age_seconds=180):
+            logger.info("Stale message skipped: date=%s", msg.get("date"))
             return "ok", 200
 
         chat_id = msg["chat"]["id"]
@@ -695,13 +385,13 @@ def telegram_webhook():
         if file_id:
             remember_file_id(file_id)
 
-        plates, saved_count = process_file(file_id, chat_id, full_name, caption)
+        plates = process_file(file_id, chat_id, full_name, caption)
 
         if plates:
             send_message(
                 chat_id,
                 "✅ Đã quét và lưu thành công.\n"
-                f"Số ảnh crop đã lưu: {saved_count}\n"
+                f"Số biển số đọc được: {len(plates)}\n"
                 "Biển số:\n" + "\n".join(plates)
             )
         else:
@@ -730,6 +420,8 @@ def telegram_webhook():
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Thiếu OPENAI_API_KEY")
 
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
