@@ -1,12 +1,12 @@
 import os
 import re
-import cv2
 import json
 import time
 import base64
 import logging
 import requests
 import numpy as np
+import cv2
 from flask import Flask, request, jsonify
 
 # =========================
@@ -14,13 +14,11 @@ from flask import Flask, request, jsonify
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "").strip()
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
 
 REQUEST_TIMEOUT = 120
 
-# chống xử lý lặp
 processed_update_ids = []
 processed_file_ids = []
 MAX_UPDATE_IDS = 5000
@@ -61,8 +59,7 @@ def is_stale_message(msg, max_age_seconds=180):
     if not msg_date:
         return False
     now_ts = int(time.time())
-    age = now_ts - int(msg_date)
-    return age > max_age_seconds
+    return (now_ts - int(msg_date)) > max_age_seconds
 
 
 # =========================
@@ -107,7 +104,7 @@ def download_telegram_file(file_id: str) -> bytes:
 
 
 # =========================
-# IMAGE UTILS
+# IMAGE
 # =========================
 def bytes_to_img(image_bytes: bytes):
     arr = np.frombuffer(image_bytes, np.uint8)
@@ -118,9 +115,6 @@ def bytes_to_img(image_bytes: bytes):
 
 
 def normalize_for_model(image_bytes: bytes, max_side: int = 1800, jpg_quality: int = 90) -> bytes:
-    """
-    Giảm kích thước hợp lý trước khi gửi GPT Vision để nhanh và rẻ hơn.
-    """
     img = bytes_to_img(image_bytes)
     h, w = img.shape[:2]
     side = max(h, w)
@@ -141,7 +135,7 @@ def normalize_for_model(image_bytes: bytes, max_side: int = 1800, jpg_quality: i
 # PLATE NORMALIZATION
 # =========================
 def normalize_plate(text: str) -> str:
-    x = (text or "").upper()
+    x = (text or "").upper().strip()
     x = x.replace("O", "0")
     x = re.sub(r"[^0-9A-Z]", "", x)
     return x
@@ -158,6 +152,22 @@ def postprocess_plates(plates):
         if is_valid_plate(n) and n not in out:
             out.append(n)
     return out
+
+
+def extract_plates_from_text(text: str):
+    """
+    Dùng cho tin nhắn text nhiều dòng:
+    51L90757
+    51L90649
+    51L90762
+    """
+    lines = [x.strip() for x in (text or "").splitlines() if x.strip()]
+    plates = []
+    for line in lines:
+        n = normalize_plate(line)
+        if is_valid_plate(n) and n not in plates:
+            plates.append(n)
+    return plates
 
 
 # =========================
@@ -178,7 +188,6 @@ def extract_plates_with_gpt(image_bytes: bytes):
             "properties": {
                 "plates": {
                     "type": "array",
-                    "description": "Danh sách biển số xe nhìn thấy rõ trong ảnh, chuẩn hóa dạng 50H31875",
                     "items": {
                         "type": "string"
                     }
@@ -197,7 +206,7 @@ def extract_plates_with_gpt(image_bytes: bytes):
         "3. Trả biển số dạng liền không dấu gạch/chấm, ví dụ: 50H31875.\n"
         "4. Nếu ảnh có nhiều cà vẹt, trả tất cả biển số nhìn thấy rõ.\n"
         "5. Không đoán. Không bịa. Nếu không chắc thì bỏ qua.\n"
-        "6. Không trả text giải thích, chỉ trả JSON đúng schema."
+        "6. Chỉ trả JSON đúng schema."
     )
 
     payload = {
@@ -255,17 +264,9 @@ def extract_plates_with_gpt(image_bytes: bytes):
 # =========================
 # APPS SCRIPT
 # =========================
-def send_to_apps_script(image_bytes: bytes, plates, caption: str, chat_id: int, name: str):
+def call_apps_script(payload: dict):
     if not APPS_SCRIPT_URL:
         raise Exception("Thiếu APPS_SCRIPT_URL")
-
-    payload = {
-        "image": base64.b64encode(image_bytes).decode("utf-8"),
-        "plates": plates or [],
-        "caption": caption or "",
-        "chatId": str(chat_id),
-        "name": name or ""
-    }
 
     r = requests.post(
         APPS_SCRIPT_URL,
@@ -301,10 +302,30 @@ def send_to_apps_script(image_bytes: bytes, plates, caption: str, chat_id: int, 
     return data
 
 
+def save_image_and_write_sheet(image_bytes: bytes, plates, caption: str, chat_id: int, name: str):
+    payload = {
+        "action": "save_image",
+        "image": base64.b64encode(image_bytes).decode("utf-8"),
+        "plates": plates or [],
+        "caption": caption or "",
+        "chatId": str(chat_id),
+        "name": name or ""
+    }
+    return call_apps_script(payload)
+
+
+def check_plates_in_sheet(plates):
+    payload = {
+        "action": "check_plates",
+        "plates": plates
+    }
+    return call_apps_script(payload)
+
+
 # =========================
 # MAIN
 # =========================
-def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
+def process_image_file(file_id: str, chat_id: int, full_name: str, caption: str):
     original_bytes = download_telegram_file(file_id)
     model_bytes = normalize_for_model(original_bytes)
 
@@ -312,8 +333,8 @@ def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
     logger.info("GPT plates: %s", plates)
 
     if plates:
-        send_to_apps_script(
-            image_bytes=original_bytes,   # lưu ảnh gốc lên Drive
+        save_image_and_write_sheet(
+            image_bytes=original_bytes,
             plates=plates,
             caption=caption,
             chat_id=chat_id,
@@ -321,6 +342,21 @@ def process_file(file_id: str, chat_id: int, full_name: str, caption: str):
         )
 
     return plates
+
+
+def process_text_plate_check(text: str):
+    plates = extract_plates_from_text(text)
+    if not plates:
+        return None, "⚠️ Không thấy biển số hợp lệ trong tin nhắn."
+
+    result = check_plates_in_sheet(plates)
+    rows = result.get("results", [])
+
+    lines = []
+    for item in rows:
+        lines.append(f"{item['plate']}\t{item['exists']}")
+
+    return rows, "\n".join(lines)
 
 
 # =========================
@@ -357,6 +393,24 @@ def telegram_webhook():
         full_name = f'{user.get("first_name", "")} {user.get("last_name", "")}'.strip()
         caption = msg.get("caption", "") or ""
 
+        # ===== text mode: check plate in sheet =====
+        if msg.get("text"):
+            text = msg.get("text", "").strip()
+
+            if text == "/start":
+                send_message(
+                    chat_id,
+                    "Gửi ảnh cà vẹt để quét biển số.\n\n"
+                    "Hoặc gửi text nhiều dòng để check trong sheet, ví dụ:\n"
+                    "51L90757\n51L90649\n51L90762"
+                )
+                return "ok", 200
+
+            rows, reply = process_text_plate_check(text)
+            send_message(chat_id, reply)
+            return "ok", 200
+
+        # ===== image mode =====
         file_id = None
 
         if msg.get("photo"):
@@ -375,7 +429,7 @@ def telegram_webhook():
             file_id = doc["file_id"]
 
         else:
-            send_message(chat_id, "📸 Gửi ảnh cà vẹt để quét biển số.")
+            send_message(chat_id, "📸 Gửi ảnh cà vẹt hoặc gửi text biển số để kiểm tra.")
             return "ok", 200
 
         if file_id and is_duplicate_file(file_id):
@@ -385,7 +439,7 @@ def telegram_webhook():
         if file_id:
             remember_file_id(file_id)
 
-        plates = process_file(file_id, chat_id, full_name, caption)
+        plates = process_image_file(file_id, chat_id, full_name, caption)
 
         if plates:
             send_message(
